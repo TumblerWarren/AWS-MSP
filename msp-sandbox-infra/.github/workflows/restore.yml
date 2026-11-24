@@ -1,0 +1,132 @@
+name: Restore AWS from Terraform
+
+on:
+  workflow_dispatch:
+    inputs:
+      finding_id:
+        description: "MSP Finding ID"
+        required: true
+      correlation_id:
+        description: "Correlation ID from the MSP platform"
+        required: true
+      allowed_addresses:
+        description: "JSON array of Terraform addresses allowed to change"
+        required: true
+      expected_drift_hash:
+        description: "Drift evidence hash approved by the engineer"
+        required: true
+      expected_commit:
+        description: "Terraform commit SHA approved by the engineer"
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_WORKING_DIR: infra
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  plan-and-gate:
+    name: Plan & Deterministic Policy Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Terraform Init & Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform plan -input=false -no-color -out=restore.tfplan
+          terraform show -json restore.tfplan > plan.raw.json
+
+      - name: Redact plan & run deterministic policy gate
+        id: gate
+        env:
+          PYTHONPATH: ${{ github.workspace }}/scripts
+        run: |
+          mkdir -p out
+          python3 -m msp_policy redact \
+            --in "${{ env.TF_WORKING_DIR }}/plan.raw.json" \
+            --out out/plan.redacted.json
+          python3 -m msp_policy gate \
+            --plan out/plan.redacted.json \
+            --mode restore \
+            --allowed '${{ inputs.allowed_addresses }}' \
+            --expected-drift-hash "${{ inputs.expected_drift_hash }}" \
+            --expected-commit "${{ inputs.expected_commit }}" \
+            --actual-commit "${{ github.sha }}" \
+            --out out/policy.json \
+            --markdown "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload policy result (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-policy-${{ inputs.correlation_id }}
+          path: |
+            out/plan.redacted.json
+            out/policy.json
+          retention-days: 14
+
+      - name: Upload approved binary plan for apply job
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-tfplan-${{ inputs.correlation_id }}
+          path: ${{ env.TF_WORKING_DIR }}/restore.tfplan
+          retention-days: 1
+
+  apply:
+    name: Apply Approved Restore Plan
+    needs: [plan-and-gate]
+    runs-on: ubuntu-latest
+    # Configure required reviewers on the 'sandbox' GitHub Environment for human authorization.
+    environment: sandbox
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Download approved plan
+        uses: actions/download-artifact@v4
+        with:
+          name: restore-tfplan-${{ inputs.correlation_id }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Init & Apply saved plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform apply -input=false -auto-approve -no-color restore.tfplan
