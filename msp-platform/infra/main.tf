@@ -7,6 +7,14 @@ terraform {
       version = "~> 5.80"
     }
   }
+
+  # Configured via -backend-config="bucket=..." in GitHub Actions (deploy-platform-infra.yml)
+  backend "s3" {
+    key          = "platform/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
 }
 
 provider "aws" {

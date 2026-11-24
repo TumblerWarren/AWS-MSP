@@ -1,0 +1,79 @@
+name: Deploy Platform AWS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      host_on_aws_fargate:
+        description: "Set true in the future to build & push the Docker image to ECR and host the app on AWS ECS Fargate (leave false while hosting locally in Docker)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_WORKING_DIR: infra
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  deploy:
+    name: Deploy Platform AWS Infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: Apply IAM roles & ECR
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="state_bucket_arn=arn:aws:s3:::${{ vars.TF_STATE_BUCKET }}" \
+            -var="deploy_ecs_service=false"
+
+      - name: Build & Push Docker image + Enable ECS Fargate (Future AWS Hosting)
+        if: ${{ inputs.host_on_aws_fargate == true }}
+        run: |
+          ECR_URL=$(terraform -chdir=${{ env.TF_WORKING_DIR }} output -raw ecr_repository_url)
+          ECR_REG=$(echo "$ECR_URL" | cut -d'/' -f1)
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" | docker login --username AWS --password-stdin "$ECR_REG"
+          docker build -t "$ECR_URL:${{ github.sha }}" -t "$ECR_URL:latest" .
+          docker push "$ECR_URL:${{ github.sha }}"
+          docker push "$ECR_URL:latest"
+          terraform -chdir=${{ env.TF_WORKING_DIR }} apply -input=false -auto-approve \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="state_bucket_arn=arn:aws:s3:::${{ vars.TF_STATE_BUCKET }}" \
+            -var="container_image_tag=${{ github.sha }}" \
+            -var="github_repo=${{ vars.SANDBOX_INFRA_REPO || '' }}" \
+            -var="github_token=${{ secrets.MSP_GITHUB_PAT || '' }}" \
+            -var="deploy_ecs_service=true"
+
+      - name: Print Outputs to Job Summary
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          ROLE_ARN=$(terraform output -raw investigator_role_arn)
+          {
+            echo "### MSP Platform Infrastructure Outputs"
+            echo "- **Investigator Read-Only Role ARN** (paste into your local Docker \`.env\` as \`MSP_INVESTIGATOR_ROLE_ARN\`):"
+            echo "  \`$ROLE_ARN\`"
+            echo "- **ECR Repository** (for future AWS Fargate hosting):"
+            echo "  \`$(terraform output -raw ecr_repository_url)\`"
+          } >> "$GITHUB_STEP_SUMMARY"

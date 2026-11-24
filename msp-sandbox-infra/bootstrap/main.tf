@@ -27,7 +27,13 @@ variable "aws_region" {
 
 variable "github_repo" {
   type        = string
-  description = "GitHub repository in 'owner/repo' format allowed to assume the CI role via OIDC (e.g. 'your-org/msp-sandbox-infra')."
+  description = "Sandbox IaC GitHub repository in 'owner/repo' format (e.g. 'your-org/msp-sandbox-infra')."
+}
+
+variable "platform_github_repo" {
+  type        = string
+  default     = ""
+  description = "Optional platform GitHub repository in 'owner/repo' format (e.g. 'your-org/msp-platform') also allowed to assume the OIDC CI role."
 }
 
 variable "state_bucket_name" {
@@ -38,6 +44,10 @@ variable "state_bucket_name" {
 
 locals {
   bucket_name = var.state_bucket_name != "" ? var.state_bucket_name : "msp-sandbox-tfstate-${data.aws_caller_identity.current.account_id}"
+  allowed_subs = compact([
+    "repo:${var.github_repo}:*",
+    var.platform_github_repo != "" ? "repo:${var.platform_github_repo}:*" : ""
+  ])
 }
 
 # --- Terraform State Bucket (native S3 lockfile locking in TF >= 1.10) ---
@@ -92,7 +102,7 @@ data "aws_iam_policy_document" "github_assume" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values   = local.allowed_subs
     }
   }
 }
@@ -119,11 +129,28 @@ data "aws_iam_policy_document" "ci_terraform_permissions" {
   }
 
   statement {
-    sid    = "SandboxInfraResources"
+    sid    = "SandboxAndPlatformInfraResources"
     effect = "Allow"
     actions = [
       "ec2:*",
       "rds:*",
+      "ecr:*",
+      "ecs:*",
+      "logs:*",
+      "iam:GetRole",
+      "iam:CreateRole",
+      "iam:DeleteRole",
+      "iam:UpdateAssumeRolePolicy",
+      "iam:AttachRolePolicy",
+      "iam:DetachRolePolicy",
+      "iam:PutRolePolicy",
+      "iam:DeleteRolePolicy",
+      "iam:GetRolePolicy",
+      "iam:ListRolePolicies",
+      "iam:ListAttachedRolePolicies",
+      "iam:PassRole",
+      "iam:TagRole",
+      "iam:CreateServiceLinkedRole",
       "secretsmanager:CreateSecret",
       "secretsmanager:DeleteSecret",
       "secretsmanager:DescribeSecret",
@@ -131,8 +158,7 @@ data "aws_iam_policy_document" "ci_terraform_permissions" {
       "secretsmanager:TagResource",
       "secretsmanager:UpdateSecret",
       "kms:CreateGrant",
-      "kms:DescribeKey",
-      "iam:CreateServiceLinkedRole"
+      "kms:DescribeKey"
     ]
     resources = ["*"]
   }

@@ -1,120 +1,73 @@
-# End-to-end AWS deployment script for MSP MVP 1.
-# Run once you have configured temporary AWS credentials in your shell.
-#
-# What it deploys:
-#   1. msp-sandbox-infra/bootstrap -> S3 state bucket + GitHub OIDC CI role
-#   2. msp-platform/infra          -> msp-investigator-readonly IAM role, ECS task roles,
-#                                     ECR repo, and ECS cluster
-#   3. Writes MSP_INVESTIGATOR_ROLE_ARN into msp-platform/backend/.env
-#   4. (Optional -DeployContainer) -> Builds & pushes the Docker image (UI + API + Strands
-#                                     Investigator + Claude Agent SDK Patcher + AWS MCP servers)
-#                                     to ECR and starts the ECS Fargate service
-#   5. (Optional -DeploySandboxInfra) -> Deploys VPC, Subnets, SGs, EC2, RDS in msp-sandbox-infra/infra
+# One-time AWS OIDC + State Bucket Bootstrap (uses local Terraform or Docker hashicorp/terraform:1.10.5).
+# After this runs once, ALL infrastructure deployments happen through GitHub Actions:
+#   - msp-sandbox-infra/.github/workflows/deploy-infra.yml
+#   - msp-platform/.github/workflows/deploy-platform-infra.yml
+# And the application runs locally in Docker via:
+#   docker compose -f msp-platform/docker-compose.yml up --build
 
 param(
-    [string]$Region = "us-east-1",
-    [string]$GitHubRepo = "owner/msp-sandbox-infra",
-    [string]$GitHubToken = "",
-    [switch]$DeployContainer,
-    [switch]$DeploySandboxInfra
+    [Parameter(Mandatory = $true)]
+    [string]$SandboxGitHubRepo,   # e.g. "your-user/msp-sandbox-infra"
+    [string]$PlatformGitHubRepo = "", # e.g. "your-user/msp-platform"
+    [string]$Region = "us-east-1"
 )
 
 $ErrorActionPreference = "Stop"
 $WorkspaceRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $BootstrapDir = Join-Path $WorkspaceRoot "msp-sandbox-infra\bootstrap"
-$SandboxInfraDir = Join-Path $WorkspaceRoot "msp-sandbox-infra\infra"
-$PlatformDir = Join-Path $WorkspaceRoot "msp-platform"
-$PlatformInfraDir = Join-Path $PlatformDir "infra"
-$BackendEnvFile = Join-Path $PlatformDir "backend\.env"
 
-Write-Host "1. Verifying AWS credentials..." -ForegroundColor Cyan
+function Invoke-Terraform {
+    param([string]$WorkDir, [string[]]$TfArgs)
+    if (Get-Command terraform -ErrorAction SilentlyContinue) {
+        Push-Location $WorkDir
+        try {
+            & terraform @TfArgs
+            if ($LASTEXITCODE -ne 0) { throw "terraform exited with code $LASTEXITCODE" }
+        } finally {
+            Pop-Location
+        }
+    } else {
+        docker run --rm `
+            -v "${WorkDir}:/workspace" `
+            -w /workspace `
+            -e AWS_ACCESS_KEY_ID `
+            -e AWS_SECRET_ACCESS_KEY `
+            -e AWS_SESSION_TOKEN `
+            -e AWS_REGION=$Region `
+            hashicorp/terraform:1.10.5 @TfArgs
+        if ($LASTEXITCODE -ne 0) { throw "docker terraform exited with code $LASTEXITCODE" }
+    }
+}
+
+Write-Host "1. Verifying temporary AWS credentials..." -ForegroundColor Cyan
 $Caller = aws sts get-caller-identity --output json | ConvertFrom-Json
 if (-not $Caller.Account) {
-    throw "No valid AWS credentials found. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN)."
+    throw "No valid AWS credentials found. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN."
 }
 Write-Host "   Authenticated as $($Caller.Arn) in account $($Caller.Account)" -ForegroundColor Green
 
-Write-Host "2. Deploying bootstrap (S3 state bucket + GitHub OIDC role)..." -ForegroundColor Cyan
-Push-Location $BootstrapDir
-try {
-    terraform init -input=false
-    terraform apply -auto-approve -var="aws_region=$Region" -var="github_repo=$GitHubRepo"
-    $StateBucket = terraform output -raw state_bucket_name
-    $StateBucketArn = terraform output -raw state_bucket_arn
-    $CiRoleArn = terraform output -raw ci_role_arn
-} finally {
-    Pop-Location
-}
+Write-Host "2. Bootstrapping S3 state bucket + GitHub Actions OIDC role..." -ForegroundColor Cyan
+Invoke-Terraform -WorkDir $BootstrapDir -TfArgs @("init", "-input=false")
+Invoke-Terraform -WorkDir $BootstrapDir -TfArgs @(
+    "apply", "-auto-approve",
+    "-var=aws_region=$Region",
+    "-var=github_repo=$SandboxGitHubRepo",
+    "-var=platform_github_repo=$PlatformGitHubRepo"
+)
 
-Write-Host "3. Deploying MSP Platform & Agent IAM roles + ECR + ECS cluster..." -ForegroundColor Cyan
-Push-Location $PlatformInfraDir
-try {
-    terraform init -input=false
-    terraform apply -auto-approve `
-        -var="aws_region=$Region" `
-        -var="state_bucket_arn=$StateBucketArn" `
-        -var="github_repo=$GitHubRepo" `
-        -var="github_token=$GitHubToken" `
-        -var="deploy_ecs_service=false"
-    $InvestigatorRoleArn = terraform output -raw investigator_role_arn
-    $EcrUrl = terraform output -raw ecr_repository_url
-} finally {
-    Pop-Location
-}
-
-Write-Host "4. Writing msp-platform/backend/.env..." -ForegroundColor Cyan
-@"
-MSP_DATABASE_URL=sqlite:///./msp.db
-MSP_AWS_REGION=$Region
-MSP_INVESTIGATOR_ROLE_ARN=$InvestigatorRoleArn
-MSP_GITHUB_REPO=$(if ($GitHubRepo -ne "owner/msp-sandbox-infra") { $GitHubRepo } else { "" })
-MSP_GITHUB_TOKEN=$GitHubToken
-MSP_STRANDS_MODEL_ID=us.anthropic.claude-sonnet-4-20250514-v1:0
-MSP_CLAUDE_USE_BEDROCK=true
-MSP_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-20250514-v1:0
-MSP_AWS_MCP_ENABLED=true
-"@ | Set-Content -Path $BackendEnvFile -Encoding UTF8
-
-if ($DeployContainer) {
-    Write-Host "5. Building & pushing Agent + Platform container to ECR ($EcrUrl)..." -ForegroundColor Cyan
-    $EcrRegistry = $EcrUrl.Split("/")[0]
-    aws ecr get-login-password --region $Region | docker login --username AWS --password-stdin $EcrRegistry
-    Push-Location $PlatformDir
-    try {
-        docker build -t "${EcrUrl}:latest" .
-        docker push "${EcrUrl}:latest"
-    } finally {
-        Pop-Location
-    }
-
-    Write-Host "   Enabling ECS Fargate service..." -ForegroundColor Cyan
-    Push-Location $PlatformInfraDir
-    try {
-        terraform apply -auto-approve `
-            -var="aws_region=$Region" `
-            -var="state_bucket_arn=$StateBucketArn" `
-            -var="github_repo=$GitHubRepo" `
-            -var="github_token=$GitHubToken" `
-            -var="deploy_ecs_service=true"
-    } finally {
-        Pop-Location
-    }
-}
-
-if ($DeploySandboxInfra) {
-    Write-Host "6. Deploying sandbox AWS infrastructure (VPC, Subnets, SGs, EC2, RDS)..." -ForegroundColor Cyan
-    Push-Location $SandboxInfraDir
-    try {
-        terraform init -input=false -backend-config="bucket=$StateBucket"
-        terraform apply -auto-approve -var="aws_region=$Region"
-    } finally {
-        Pop-Location
-    }
-}
+$StateBucket = (Invoke-Terraform -WorkDir $BootstrapDir -TfArgs @("output", "-raw", "state_bucket_name") | Select-Object -Last 1).Trim()
+$CiRoleArn = (Invoke-Terraform -WorkDir $BootstrapDir -TfArgs @("output", "-raw", "ci_role_arn") | Select-Object -Last 1).Trim()
 
 Write-Host ""
-Write-Host "Deployment Summary:" -ForegroundColor Green
-Write-Host "  State Bucket         : $StateBucket"
-Write-Host "  GitHub OIDC CI Role  : $CiRoleArn"
-Write-Host "  Investigator Role ARN: $InvestigatorRoleArn"
-Write-Host "  ECR Repository       : $EcrUrl"
+Write-Host "Bootstrap complete! Configure these on both GitHub repos ($SandboxGitHubRepo and $PlatformGitHubRepo):" -ForegroundColor Green
+Write-Host "  Repository Secret   AWS_CI_ROLE_ARN = $CiRoleArn"
+Write-Host "  Repository Variable TF_STATE_BUCKET = $StateBucket"
+Write-Host "  Repository Variable AWS_REGION      = $Region"
+Write-Host ""
+Write-Host "Then trigger the GitHub Actions workflows:" -ForegroundColor Cyan
+Write-Host "  1. msp-platform      -> 'Deploy Platform AWS Infrastructure' (creates msp-investigator-readonly role; leave host_on_aws_fargate=false)"
+Write-Host "  2. msp-sandbox-infra -> 'Deploy Sandbox Infrastructure' (deploys VPC, Subnets, SGs, EC2, RDS)"
+Write-Host ""
+Write-Host "Finally, run the application locally in Docker:" -ForegroundColor Cyan
+Write-Host "  cd msp-platform"
+Write-Host "  docker compose up --build"
