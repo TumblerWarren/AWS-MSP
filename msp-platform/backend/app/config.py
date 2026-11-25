@@ -19,9 +19,9 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./msp.db"
 
     # Target IaC repository (GitHub + local path fallback)
-    github_repo: str = ""  # owner/repo
+    github_repo: str = "TumblerWarren/AWS-MSP"  # owner/repo
     github_token: str = ""
-    github_default_branch: str = "main"
+    github_default_branch: str = "master"
     local_infra_repo_path: str = "../../msp-sandbox-infra"
     dry_run_github: bool = False
 

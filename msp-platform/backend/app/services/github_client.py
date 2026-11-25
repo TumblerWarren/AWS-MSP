@@ -15,7 +15,7 @@ class GitHubError(RuntimeError):
 
 
 class GitHubClient:
-    def __init__(self, repo: str, token: str, default_branch: str = "main") -> None:
+    def __init__(self, repo: str, token: str, default_branch: str = "master") -> None:
         self.repo = repo.strip()
         self.token = token.strip()
         self.default_branch = default_branch
