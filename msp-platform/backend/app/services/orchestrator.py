@@ -48,16 +48,25 @@ def _infer_severity(resource_type: str, changes: list[dict[str, Any]], drift_kin
     return "medium"
 
 
+def _resolve_tf_dir(base_root: Path, root_dir: str = "infra") -> tuple[Path, str]:
+    """Locate the sandbox Terraform directory whether base_root is a monorepo (AWS-MSP) or standalone."""
+    for candidate in (root_dir, "msp-sandbox-infra/infra", "infra"):
+        p = base_root / candidate
+        if p.is_dir():
+            return p, candidate
+    return base_root / root_dir, root_dir
+
+
 def _read_local_tf_context(infra_root: Path, root_dir: str = "infra") -> str:
     """Read Terraform .tf files from the local infra checkout to give agents full context."""
-    tf_dir = infra_root / root_dir
+    tf_dir, rel_dir = _resolve_tf_dir(infra_root, root_dir)
     if not tf_dir.is_dir():
         return ""
     chunks: list[str] = []
     for path in sorted(tf_dir.glob("*.tf")):
         try:
             content = path.read_text(encoding="utf-8")
-            chunks.append(f"### File: {root_dir}/{path.name}\n```hcl\n{content}\n```")
+            chunks.append(f"### File: {rel_dir}/{path.name}\n```hcl\n{content}\n```")
         except OSError:
             continue
     return "\n\n".join(chunks)
@@ -424,6 +433,8 @@ class Orchestrator:
             work_dir = Path(tmp) / "repo"
             try:
                 self._prepare_repo_workspace(work_dir, branch_name)
+                _, resolved_rel = _resolve_tf_dir(work_dir, finding.root_dir)
+                finding.root_dir = resolved_rel
                 patch = await patch_terraform_workspace(
                     repo_dir=work_dir,
                     finding=finding,
