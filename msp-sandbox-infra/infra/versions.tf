@@ -11,7 +11,7 @@ terraform {
   # Configure via -backend-config="bucket=..." during terraform init (see CI workflows).
   backend "s3" {
     key          = "sandbox/terraform.tfstate"
-    region       = "us-east-1"
+    region       = "ap-south-1"
     encrypt      = true
     use_lockfile = true
   }

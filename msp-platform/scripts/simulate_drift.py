@@ -48,7 +48,7 @@ def rds_retention(db_id: str, region: str, days: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Introduce sandbox drift for MSP MVP testing.")
-    p.add_argument("--region", default="us-east-1")
+    p.add_argument("--region", default="ap-south-1")
     sub = p.add_subparsers(dest="scenario", required=True)
 
     s1 = sub.add_parser("sg-open-ssh", help="Open SSH 0.0.0.0/0 on the app security group")

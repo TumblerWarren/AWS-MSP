@@ -14,7 +14,7 @@ permissions:
 
 env:
   TF_WORKING_DIR: msp-sandbox-infra/infra
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
 
 jobs:
   drift-check:
@@ -42,7 +42,10 @@ jobs:
 
       - name: Terraform Init
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
 
       - name: Read state metadata (serial & lineage only, no values)
         id: state_meta
@@ -60,7 +63,7 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           set +e
-          terraform plan -refresh-only -detailed-exitcode -input=false -no-color -out=drift.tfplan
+          terraform plan -refresh-only -detailed-exitcode -input=false -no-color -var="aws_region=${{ env.AWS_REGION }}" -out=drift.tfplan
           CODE=$?
           echo "exitcode=$CODE" >> "$GITHUB_OUTPUT"
           if [ "$CODE" -eq 1 ]; then

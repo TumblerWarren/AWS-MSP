@@ -26,16 +26,16 @@ class Settings(BaseSettings):
     dry_run_github: bool = False
 
     # AWS & read-only investigator role
-    aws_region: str = "us-east-1"
+    aws_region: str = "ap-south-1"
     investigator_role_arn: str = ""
 
     # Strands Investigation Agent (AWS Bedrock + AWS Labs MCP servers)
-    strands_model_id: str = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+    strands_model_id: str = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
     aws_mcp_enabled: bool = True
 
     # Claude Agent SDK Patcher (Bedrock or Anthropic API)
     claude_use_bedrock: bool = True
-    claude_model: str = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+    claude_model: str = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
 
     @property
     def github_configured(self) -> bool:

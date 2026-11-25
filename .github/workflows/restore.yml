@@ -26,7 +26,7 @@ permissions:
 
 env:
   TF_WORKING_DIR: msp-sandbox-infra/infra
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
 
 jobs:
   plan-and-gate:
@@ -56,8 +56,10 @@ jobs:
       - name: Terraform Init & Plan
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
-          terraform plan -input=false -no-color -out=restore.tfplan
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+          terraform plan -input=false -no-color -var="aws_region=${{ env.AWS_REGION }}" -out=restore.tfplan
           terraform show -json restore.tfplan > plan.raw.json
 
       - name: Redact plan & run deterministic policy gate
@@ -127,5 +129,7 @@ jobs:
       - name: Terraform Init & Apply saved plan
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
           terraform apply -input=false -auto-approve -no-color restore.tfplan

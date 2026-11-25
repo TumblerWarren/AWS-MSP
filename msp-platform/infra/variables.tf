@@ -1,6 +1,6 @@
 variable "aws_region" {
   type    = string
-  default = "us-east-1"
+  default = "ap-south-1"
 }
 
 variable "state_bucket_arn" {
@@ -27,12 +27,12 @@ variable "container_image_tag" {
 
 variable "strands_model_id" {
   type    = string
-  default = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+  default = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
 }
 
 variable "claude_model_id" {
   type    = string
-  default = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+  default = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
 }
 
 variable "github_repo" {
