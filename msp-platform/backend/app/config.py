@@ -1,11 +1,18 @@
-"""Application configuration via environment variables (.env)."""
+"""Application configuration via environment variables (.env) and runtime updates."""
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load .env into os.environ so boto3, Strands BedrockModel, AWS MCP servers,
+# and Claude Agent SDK subprocesses immediately see AWS_* variables.
+load_dotenv(override=False)
 
 
 class Settings(BaseSettings):
@@ -14,6 +21,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     database_url: str = "sqlite:///./msp.db"
@@ -25,8 +33,23 @@ class Settings(BaseSettings):
     local_infra_repo_path: str = "../../msp-sandbox-infra"
     dry_run_github: bool = False
 
-    # AWS & read-only investigator role
-    aws_region: str = "ap-south-1"
+    # AWS credentials (supports static IAM key+secret OR temporary key+secret+session_token)
+    aws_region: str = Field(
+        default="ap-south-1",
+        validation_alias=AliasChoices("MSP_AWS_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"),
+    )
+    aws_access_key_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("MSP_AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+    )
+    aws_secret_access_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("MSP_AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+    )
+    aws_session_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("MSP_AWS_SESSION_TOKEN", "AWS_SESSION_TOKEN"),
+    )
     investigator_role_arn: str = ""
 
     # Strands Investigation Agent (AWS Bedrock + AWS Labs MCP servers)
@@ -46,7 +69,24 @@ class Settings(BaseSettings):
         base = Path(__file__).resolve().parent.parent
         return (base / self.local_infra_repo_path).resolve()
 
+    def sync_aws_env(self) -> None:
+        """Propagate configured AWS credentials into os.environ for SDKs and subprocesses."""
+        if self.aws_region:
+            os.environ["AWS_REGION"] = self.aws_region
+            os.environ["AWS_DEFAULT_REGION"] = self.aws_region
+        if self.aws_access_key_id and self.aws_secret_access_key:
+            os.environ["AWS_ACCESS_KEY_ID"] = self.aws_access_key_id.strip()
+            os.environ["AWS_SECRET_ACCESS_KEY"] = self.aws_secret_access_key.strip()
+            if self.aws_session_token.strip():
+                os.environ["AWS_SESSION_TOKEN"] = self.aws_session_token.strip()
+            else:
+                # When using a permanent IAM Access Key + Secret without a session token,
+                # make sure any stale AWS_SESSION_TOKEN is removed.
+                os.environ.pop("AWS_SESSION_TOKEN", None)
+
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    s.sync_aws_env()
+    return s

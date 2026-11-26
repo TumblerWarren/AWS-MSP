@@ -20,6 +20,19 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   config: () => req<PlatformConfig>("/api/config"),
+  updateCredentials: (payload: {
+    aws_access_key_id?: string;
+    aws_secret_access_key?: string;
+    aws_session_token?: string;
+    aws_region?: string;
+    investigator_role_arn?: string;
+    github_repo?: string;
+    github_token?: string;
+  }) =>
+    req<PlatformConfig>("/api/config/credentials", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   listFindings: () => req<FindingSummary[]>("/api/findings"),
   getFinding: (id: string) => req<FindingDetail>(`/api/findings/${id}`),
   seedDemo: () => req<{ created: number; findings: FindingSummary[] }>("/api/demo/seed", { method: "POST" }),

@@ -21,9 +21,10 @@ from .models import (
     Investigation,
     Remediation,
     TriggerScanRequest,
+    UpdateCredentialsRequest,
     VerifyRequest,
 )
-from .services.aws_session import has_aws_credentials
+from .services.aws_session import aws_credential_mode, has_aws_credentials
 from .services.orchestrator import Orchestrator
 from .store import Store
 
@@ -205,12 +206,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "github_repo": cfg.github_repo,
             "aws_region": cfg.aws_region,
             "aws_credentials_detected": has_aws_credentials(),
+            "aws_credential_mode": aws_credential_mode(),
             "investigator_role_configured": bool(cfg.investigator_role_arn),
+            "investigator_role_arn": cfg.investigator_role_arn,
             "strands_model_id": cfg.strands_model_id,
             "claude_model": cfg.claude_model,
             "claude_use_bedrock": cfg.claude_use_bedrock,
             "aws_mcp_enabled": cfg.aws_mcp_enabled,
         }
+
+    @app.post("/api/config/credentials")
+    def update_credentials(body: UpdateCredentialsRequest) -> dict[str, Any]:
+        """Update AWS Access Key / Secret Key / optional Session Token & GitHub credentials at runtime."""
+        if body.aws_region is not None and body.aws_region.strip():
+            cfg.aws_region = body.aws_region.strip()
+        if body.aws_access_key_id is not None:
+            cfg.aws_access_key_id = body.aws_access_key_id.strip()
+        if body.aws_secret_access_key is not None:
+            cfg.aws_secret_access_key = body.aws_secret_access_key.strip()
+        if body.aws_session_token is not None:
+            cfg.aws_session_token = body.aws_session_token.strip()
+        if body.investigator_role_arn is not None:
+            cfg.investigator_role_arn = body.investigator_role_arn.strip()
+        if body.github_repo is not None and body.github_repo.strip():
+            cfg.github_repo = body.github_repo.strip()
+        if body.github_token is not None:
+            cfg.github_token = body.github_token.strip()
+        cfg.sync_aws_env()
+        return platform_config()
 
     @app.get("/api/findings")
     def list_findings(s: Store = Depends(get_store)) -> list[dict[str, Any]]:

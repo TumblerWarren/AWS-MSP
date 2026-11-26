@@ -78,10 +78,15 @@ def _build_patch_prompt(finding: Finding, extra_instructions: str = "") -> str:
 
 def _claude_env(settings: Settings) -> dict[str, str]:
     """Environment passed to the Claude Agent SDK subprocess."""
+    settings.sync_aws_env()
     env: dict[str, str] = {}
     if settings.claude_use_bedrock:
         env["CLAUDE_CODE_USE_BEDROCK"] = "1"
         env["AWS_REGION"] = settings.aws_region
+        for aws_key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+            val = os.environ.get(aws_key, "").strip()
+            if val:
+                env[aws_key] = val
     # Forward optional Anthropic proxy / key if present in host env
     for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
         if os.environ.get(key):

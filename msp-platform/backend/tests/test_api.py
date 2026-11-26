@@ -171,3 +171,35 @@ def test_agentcore_ping_and_invocations_endpoint(tmp_path: Path):
             assert inv.status_code == 200
             assert inv.json()["status"] == "investigated"
 
+
+def test_update_credentials_supports_static_key_and_temporary_session(tmp_path: Path):
+    with _make_client(tmp_path) as client:
+        # 1. Static IAM Access Key + Secret Key (no session token)
+        r1 = client.post(
+            "/api/config/credentials",
+            json={
+                "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "aws_session_token": "",
+                "aws_region": "ap-south-1",
+            },
+        )
+        assert r1.status_code == 200
+        assert r1.json()["aws_credentials_detected"] is True
+        assert r1.json()["aws_credential_mode"] == "access_key"
+
+        # 2. Temporary STS Credentials (Access Key + Secret Key + Session Token)
+        r2 = client.post(
+            "/api/config/credentials",
+            json={
+                "aws_access_key_id": "ASIAIOSFODNN7EXAMPLE",
+                "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "aws_session_token": "FwoGZXIvYXdzEBYaDH...",
+                "aws_region": "ap-south-1",
+            },
+        )
+        assert r2.status_code == 200
+        assert r2.json()["aws_credentials_detected"] is True
+        assert r2.json()["aws_credential_mode"] == "temporary_session"
+
+

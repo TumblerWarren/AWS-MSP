@@ -3,11 +3,13 @@ import {
   Activity,
   CheckCircle2,
   Database,
+  KeyRound,
   Play,
   RefreshCw,
   Search,
   Shield,
   Terminal,
+  X,
 } from "lucide-react";
 import { api } from "./api";
 import { FindingDetailView } from "./components/FindingDetail";
@@ -29,6 +31,15 @@ export function App() {
   const [query, setQuery] = useState("");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [banner, setBanner] = useState<{ kind: "info" | "error"; text: string } | null>(null);
+  const [showCreds, setShowCreds] = useState(false);
+  const [credForm, setCredForm] = useState({
+    aws_access_key_id: "",
+    aws_secret_access_key: "",
+    aws_session_token: "",
+    aws_region: "ap-south-1",
+    investigator_role_arn: "",
+    github_token: "",
+  });
 
   async function refreshList(preserveSelection = true) {
     const [cfg, list] = await Promise.all([api.config(), api.listFindings()]);
@@ -104,13 +115,32 @@ export function App() {
               </span>
               <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 ${config.aws_credentials_detected ? "border-emerald-500/30 text-emerald-300 bg-emerald-500/5" : "border-zinc-800 text-zinc-400 bg-zinc-900"}`}>
                 <span className={`w-1.5 h-1.5 rounded-full ${config.aws_credentials_detected ? "bg-emerald-400" : "bg-zinc-500"}`} />
-                {config.aws_credentials_detected ? `AWS: ${config.aws_region}` : "AWS: offline preview"}
+                {config.aws_credentials_detected
+                  ? `AWS: ${config.aws_region} (${config.aws_credential_mode === "temporary_session" ? "temp session" : "key/secret"})`
+                  : "AWS: offline preview"}
               </span>
             </div>
           )}
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              if (config) {
+                setCredForm((prev) => ({
+                  ...prev,
+                  aws_region: config.aws_region || "ap-south-1",
+                  investigator_role_arn: config.investigator_role_arn || prev.investigator_role_arn,
+                }));
+              }
+              setShowCreds(true);
+            }}
+            className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800 cursor-pointer"
+          >
+            <KeyRound className="w-3.5 h-3.5 text-amber-400" />
+            AWS Credentials
+          </button>
+
           <button
             onClick={() =>
               runAction("seed", async () => {
@@ -310,6 +340,121 @@ export function App() {
           )}
         </main>
       </div>
+
+      {showCreds && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
+          <div className="w-full max-w-lg rounded-xl border border-zinc-800 bg-[#111114] p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-semibold text-zinc-100">AWS & GitHub Credentials</h2>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Supports static IAM Access Key + Secret Key, or Temporary Session Credentials (+ Session Token).
+                </p>
+              </div>
+              <button onClick={() => setShowCreds(false)} className="text-zinc-400 hover:text-zinc-200 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block text-zinc-400 mb-1 font-mono">AWS_ACCESS_KEY_ID</label>
+                <input
+                  type="text"
+                  value={credForm.aws_access_key_id}
+                  onChange={(e) => setCredForm({ ...credForm, aws_access_key_id: e.target.value })}
+                  placeholder="AKIA... (permanent) or ASIA... (temporary)"
+                  className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-zinc-200"
+                />
+              </div>
+
+              <div>
+                <label className="block text-zinc-400 mb-1 font-mono">AWS_SECRET_ACCESS_KEY</label>
+                <input
+                  type="password"
+                  value={credForm.aws_secret_access_key}
+                  onChange={(e) => setCredForm({ ...credForm, aws_secret_access_key: e.target.value })}
+                  placeholder="Secret access key"
+                  className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-zinc-200"
+                />
+              </div>
+
+              <div>
+                <label className="block text-zinc-400 mb-1 font-mono">
+                  AWS_SESSION_TOKEN <span className="text-zinc-500">(optional — leave empty for static IAM keys)</span>
+                </label>
+                <input
+                  type="password"
+                  value={credForm.aws_session_token}
+                  onChange={(e) => setCredForm({ ...credForm, aws_session_token: e.target.value })}
+                  placeholder="Only required for temporary ASIA... credentials"
+                  className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-zinc-200"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-zinc-400 mb-1 font-mono">AWS_REGION</label>
+                  <input
+                    type="text"
+                    value={credForm.aws_region}
+                    onChange={(e) => setCredForm({ ...credForm, aws_region: e.target.value })}
+                    className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-zinc-200"
+                  />
+                </div>
+                <div>
+                  <label className="block text-zinc-400 mb-1 font-mono">MSP_GITHUB_TOKEN (optional)</label>
+                  <input
+                    type="password"
+                    value={credForm.github_token}
+                    onChange={(e) => setCredForm({ ...credForm, github_token: e.target.value })}
+                    placeholder="ghp_... or github_pat_..."
+                    className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-zinc-200"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-zinc-400 mb-1 font-mono">
+                  MSP_INVESTIGATOR_ROLE_ARN <span className="text-zinc-500">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={credForm.investigator_role_arn}
+                  onChange={(e) => setCredForm({ ...credForm, investigator_role_arn: e.target.value })}
+                  placeholder="arn:aws:iam::<account>:role/msp-investigator-readonly"
+                  className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 font-mono text-zinc-200"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                onClick={() => setShowCreds(false)}
+                className="rounded-md border border-zinc-800 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-900 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() =>
+                  runAction("creds", async () => {
+                    const updated = await api.updateCredentials(credForm);
+                    setConfig(updated);
+                    setShowCreds(false);
+                    setBanner({
+                      kind: "info",
+                      text: `Updated AWS credentials (mode=${updated.aws_credential_mode ?? "configured"}, region=${updated.aws_region}).`,
+                    });
+                  })
+                }
+                className="rounded-md bg-emerald-500 px-3.5 py-1.5 text-xs font-semibold text-zinc-950 hover:bg-emerald-400 cursor-pointer"
+              >
+                Save Credentials
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

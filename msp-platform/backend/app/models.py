@@ -170,3 +170,14 @@ class VerifyRequest(BaseModel):
     # Optional redacted plan payload for offline/local verification testing
     plan: dict[str, Any] | None = None
     meta: dict[str, Any] = PydanticField(default_factory=dict)
+
+
+class UpdateCredentialsRequest(BaseModel):
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_session_token: str | None = None
+    aws_region: str | None = None
+    investigator_role_arn: str | None = None
+    github_repo: str | None = None
+    github_token: str | None = None
+

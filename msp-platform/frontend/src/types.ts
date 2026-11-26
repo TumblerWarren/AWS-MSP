@@ -136,7 +136,9 @@ export interface PlatformConfig {
   github_repo: string;
   aws_region: string;
   aws_credentials_detected: boolean;
+  aws_credential_mode?: string;
   investigator_role_configured: boolean;
+  investigator_role_arn?: string;
   strands_model_id: string;
   claude_model: string;
   claude_use_bedrock: boolean;
