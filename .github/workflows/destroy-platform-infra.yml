@@ -54,5 +54,6 @@ jobs:
             -backend-config="region=${{ env.AWS_REGION }}"
           terraform destroy -input=false -auto-approve \
             -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="state_bucket_arn=arn:aws:s3:::${{ vars.TF_STATE_BUCKET }}"
-          echo "### All Platform AWS Infrastructure Removed" >> "$GITHUB_STEP_SUMMARY"
+            -var="state_bucket_arn=arn:aws:s3:::${{ vars.TF_STATE_BUCKET }}" \
+            -var="deploy_ecs_service=true"
+          echo "### All Platform AWS Infrastructure (ECS Fargate, ECR, Logs, IAM Roles) Removed" >> "$GITHUB_STEP_SUMMARY"
