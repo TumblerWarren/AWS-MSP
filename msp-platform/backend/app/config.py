@@ -14,6 +14,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # and Claude Agent SDK subprocesses immediately see AWS_* variables.
 load_dotenv(override=False)
 
+DEFAULT_BEDROCK_MODEL_ID = "au.anthropic.claude-sonnet-4-6"
+BEDROCK_MODELS = {
+    DEFAULT_BEDROCK_MODEL_ID: ("Claude Sonnet 4.6 · Australia", "ap-southeast-2"),
+    "au.anthropic.claude-sonnet-5-5": ("Claude Sonnet 5.5 · Australia", "ap-southeast-2"),
+    "in.anthropic.claude-haiku-4-5-20251001-v1:0": ("Claude Haiku 4.5 · India", "ap-south-1"),
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -32,6 +39,7 @@ class Settings(BaseSettings):
     github_default_branch: str = "master"
     local_infra_repo_path: str = "../../msp-sandbox-infra"
     dry_run_github: bool = False
+    drift_report_bucket: str = ""
 
     # AWS credentials (supports static IAM key+secret OR temporary key+secret+session_token)
     aws_region: str = Field(
@@ -53,12 +61,25 @@ class Settings(BaseSettings):
     investigator_role_arn: str = ""
 
     # Strands Investigation Agent (AWS Bedrock + AWS Labs MCP servers)
-    strands_model_id: str = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
+    bedrock_region: str = ""
+    strands_model_id: str = DEFAULT_BEDROCK_MODEL_ID
     aws_mcp_enabled: bool = True
 
     # Claude Agent SDK Patcher (Bedrock or Anthropic API)
     claude_use_bedrock: bool = True
-    claude_model: str = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
+    claude_model: str = DEFAULT_BEDROCK_MODEL_ID
+
+    def bedrock_region_for_model(self, model_id: str) -> str:
+        if self.bedrock_region:
+            return self.bedrock_region
+        if model_id == DEFAULT_BEDROCK_MODEL_ID:
+            return BEDROCK_MODELS[DEFAULT_BEDROCK_MODEL_ID][1]
+        return self.aws_region
+
+    def resolve_bedrock_model(self, default_id: str, selected_id: str | None) -> tuple[str, str]:
+        if selected_id and selected_id in BEDROCK_MODELS:
+            return selected_id, BEDROCK_MODELS[selected_id][1]
+        return default_id, self.bedrock_region_for_model(default_id)
 
     @property
     def github_configured(self) -> bool:

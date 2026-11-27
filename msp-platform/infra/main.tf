@@ -153,6 +153,13 @@ data "aws_iam_policy_document" "investigator_guardrails" {
     ]
     resources = ["*"]
   }
+
+  statement {
+    sid       = "DenyDirectDriftReportAccess"
+    effect    = "Deny"
+    actions   = ["s3:*"]
+    resources = [aws_s3_bucket.drift_reports.arn, "${aws_s3_bucket.drift_reports.arn}/*"]
+  }
 }
 
 resource "aws_iam_role_policy" "investigator_guardrails" {
@@ -178,6 +185,18 @@ data "aws_iam_policy_document" "platform_task_permissions" {
     effect    = "Allow"
     actions   = ["sts:AssumeRole"]
     resources = [aws_iam_role.investigator_readonly.arn]
+  }
+
+  statement {
+    sid       = "ReadDriftReports"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.drift_reports.arn}/drift-reports/*"]
+  }
+
+  statement {
+    sid       = "DetectMissingDriftReports"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.drift_reports.arn]
   }
 }
 
@@ -218,11 +237,13 @@ resource "aws_ecs_task_definition" "platform" {
       ]
       environment = [
         { name = "MSP_AWS_REGION", value = var.aws_region },
+        { name = "MSP_BEDROCK_REGION", value = var.bedrock_region },
         { name = "MSP_INVESTIGATOR_ROLE_ARN", value = aws_iam_role.investigator_readonly.arn },
         { name = "MSP_STRANDS_MODEL_ID", value = var.strands_model_id },
         { name = "MSP_CLAUDE_MODEL", value = var.claude_model_id },
         { name = "MSP_CLAUDE_USE_BEDROCK", value = "true" },
         { name = "MSP_AWS_MCP_ENABLED", value = "true" },
+        { name = "MSP_DRIFT_REPORT_BUCKET", value = aws_s3_bucket.drift_reports.bucket },
         { name = "MSP_GITHUB_REPO", value = var.github_repo },
         { name = "MSP_GITHUB_TOKEN", value = var.github_token }
       ]

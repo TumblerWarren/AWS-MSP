@@ -75,10 +75,12 @@ jobs:
           terraform show -json drift.tfplan > plan.raw.json
 
       - name: Redact plan and extract metadata
+        id: report
         env:
           PYTHONPATH: ${{ github.workspace }}/msp-sandbox-infra/scripts
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
           mkdir -p out
           python3 -m msp_policy redact \
             --in "${{ env.TF_WORKING_DIR }}/plan.raw.json" \
@@ -100,12 +102,26 @@ jobs:
             --plan out/plan.redacted.json \
             --out out/drift.json
 
-      - name: Upload redacted drift report
-        uses: actions/upload-artifact@v4
-        with:
-          name: drift-report-${{ inputs.correlation_id || github.run_id }}
-          path: |
-            out/plan.redacted.json
-            out/meta.json
-            out/drift.json
-          retention-days: 14
+      - name: Store redacted drift report in S3
+        env:
+          ACCOUNT_ID: ${{ steps.report.outputs.account_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          files = ("plan.redacted.json", "meta.json", "drift.json")
+          output = Path("out")
+          report = {name: json.loads((output / name).read_text(encoding="utf-8")) for name in files}
+          if report["plan.redacted.json"].get("msp_redacted") is not True:
+              raise SystemExit("The drift plan must be redacted before upload")
+          with (output / "report.json").open("w", encoding="utf-8") as file:
+              json.dump(report, file, separators=(",", ":"))
+          PY
+          aws s3api put-object \
+            --bucket "msp-drift-reports-${ACCOUNT_ID}-${AWS_REGION}" \
+            --expected-bucket-owner "$ACCOUNT_ID" \
+            --key "drift-reports/${GITHUB_REPOSITORY,,}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}.json" \
+            --body out/report.json \
+            --content-type application/json \
+            --no-cli-pager > /dev/null

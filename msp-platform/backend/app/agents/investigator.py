@@ -123,7 +123,7 @@ def _run_strands_sync(
     """Run the Strands Investigation Agent synchronously inside a worker thread."""
     model = BedrockModel(
         model_id=settings.strands_model_id,
-        region_name=settings.aws_region,
+        region_name=settings.bedrock_region_for_model(settings.strands_model_id),
     )
     prompt = _build_investigation_prompt(finding, tf_context)
 

@@ -6,9 +6,10 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from .models import AuditEvent, Finding, Investigation, Remediation
+from .models import AuditEvent, Finding, Investigation, ModelPreferences, Remediation
 
 
 def _utcnow() -> datetime:
@@ -22,6 +23,17 @@ class Store:
 
     def init_db(self) -> None:
         SQLModel.metadata.create_all(self.engine)
+
+    def get_model_preferences(self) -> ModelPreferences:
+        with Session(self.engine) as session:
+            return session.get(ModelPreferences, 1) or ModelPreferences()
+
+    def save_model_preferences(self, investigation: str | None, patcher: str | None) -> None:
+        values = {"investigation": investigation, "patcher": patcher}
+        stmt = insert(ModelPreferences).values(id=1, **values).on_conflict_do_update(index_elements=["id"], set_=values)
+        with Session(self.engine) as session:
+            session.execute(stmt)
+            session.commit()
 
     # --- Findings ---
     def list_findings(self) -> list[Finding]:

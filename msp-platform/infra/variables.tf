@@ -25,14 +25,20 @@ variable "container_image_tag" {
   default = "latest"
 }
 
+variable "bedrock_region" {
+  type        = string
+  default     = ""
+  description = "Optional Bedrock source region override for model inference."
+}
+
 variable "strands_model_id" {
   type    = string
-  default = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
+  default = "au.anthropic.claude-sonnet-4-6"
 }
 
 variable "claude_model_id" {
   type    = string
-  default = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
+  default = "au.anthropic.claude-sonnet-4-6"
 }
 
 variable "github_repo" {

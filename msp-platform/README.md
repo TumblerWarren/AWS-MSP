@@ -11,3 +11,15 @@ Application repository for the AWS AI Infrastructure Drift Investigation & Recon
   - `app/services/orchestrator.py` — End-to-end orchestration: drift ingestion, investigation, fingerprint-bound decisions (`restore` vs `update_terraform`), deterministic policy checks, verification, and audit logging.
 - `frontend/` — React + TypeScript + Vite + Tailwind dark developer UI.
 - `scripts/` — `simulate_drift.py`, `sync_policy_vendor.ps1`, `destroy.ps1`.
+
+## Drift reports in S3
+
+The Drift Check workflow writes its redacted plan, metadata, and drift summary as one JSON object under `drift-reports/<owner>/<repo>/<run-id>/<attempt>.json`. The platform stack creates a private, encrypted report bucket with a 14-day expiration policy. The ECS task role reads these reports when you click **Sync GitHub**. Older GitHub reports can still be imported while their artifacts are available.
+
+When deploying with the bootstrap OIDC role, apply the updated sandbox bootstrap stack to grant the CI role access to the report bucket. If CI uses AWS access keys, grant their IAM principal the report bucket permissions defined in the bootstrap policy. Run **Deploy Platform AWS Infrastructure** with `host_on_aws_fargate=true` for ECS, using the same AWS account and region as Drift Check. The deploy summary shows the bucket name. Local backend or Docker Compose users can set `MSP_DRIFT_REPORT_BUCKET` in `backend/.env` and use AWS credentials with report read access.
+
+Back up or remove any retained reports before destroying the platform stack. Terraform protects the report bucket from deletion while it contains objects.
+
+## Bedrock model routing
+
+The default `au.anthropic.claude-sonnet-4-6` profile uses Sydney as its Bedrock endpoint and can process requests in Sydney or Melbourne. AWS and CloudTrail tools continue using the platform AWS region. For a custom model, the app uses the platform AWS region unless you set `MSP_BEDROCK_REGION` locally or the platform Terraform `bedrock_region` variable for ECS.

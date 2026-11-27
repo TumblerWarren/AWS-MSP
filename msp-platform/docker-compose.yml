@@ -17,9 +17,9 @@ services:
       MSP_INVESTIGATOR_ROLE_ARN: ${MSP_INVESTIGATOR_ROLE_ARN:-}
       MSP_GITHUB_REPO: ${MSP_GITHUB_REPO:-TumblerWarren/AWS-MSP}
       MSP_GITHUB_TOKEN: ${MSP_GITHUB_TOKEN:-}
-      MSP_STRANDS_MODEL_ID: ${MSP_STRANDS_MODEL_ID:-apac.anthropic.claude-sonnet-4-20250514-v1:0}
+      MSP_STRANDS_MODEL_ID: ${MSP_STRANDS_MODEL_ID:-au.anthropic.claude-sonnet-4-6}
       MSP_CLAUDE_USE_BEDROCK: ${MSP_CLAUDE_USE_BEDROCK:-true}
-      MSP_CLAUDE_MODEL: ${MSP_CLAUDE_MODEL:-apac.anthropic.claude-sonnet-4-20250514-v1:0}
+      MSP_CLAUDE_MODEL: ${MSP_CLAUDE_MODEL:-au.anthropic.claude-sonnet-4-6}
       MSP_AWS_MCP_ENABLED: ${MSP_AWS_MCP_ENABLED:-true}
       # Temporary AWS credentials passed from host environment or backend/.env
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}

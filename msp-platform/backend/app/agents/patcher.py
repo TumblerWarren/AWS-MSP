@@ -82,7 +82,9 @@ def _claude_env(settings: Settings) -> dict[str, str]:
     env: dict[str, str] = {}
     if settings.claude_use_bedrock:
         env["CLAUDE_CODE_USE_BEDROCK"] = "1"
-        env["AWS_REGION"] = settings.aws_region
+        bedrock_region = settings.bedrock_region_for_model(settings.claude_model)
+        env["AWS_REGION"] = bedrock_region
+        env["AWS_DEFAULT_REGION"] = bedrock_region
         for aws_key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
             val = os.environ.get(aws_key, "").strip()
             if val:

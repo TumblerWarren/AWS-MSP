@@ -131,6 +131,11 @@ export interface FindingDetail extends FindingSummary {
   audit_events: AuditEvent[];
 }
 
+export interface ModelPreferences {
+  investigation: string | null;
+  patcher: string | null;
+}
+
 export interface PlatformConfig {
   github_configured: boolean;
   github_repo: string;
@@ -142,5 +147,7 @@ export interface PlatformConfig {
   strands_model_id: string;
   claude_model: string;
   claude_use_bedrock: boolean;
+  model_preferences: ModelPreferences;
+  bedrock_models: { id: string; label: string }[];
   aws_mcp_enabled: boolean;
 }

@@ -13,3 +13,7 @@ output "ecr_repository_url" {
 output "ecs_cluster_name" {
   value = aws_ecs_cluster.main.name
 }
+
+output "drift_report_bucket" {
+  value = aws_s3_bucket.drift_reports.bucket
+}

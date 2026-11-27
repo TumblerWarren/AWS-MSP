@@ -11,7 +11,9 @@ import httpx
 
 
 class GitHubError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class GitHubClient:
@@ -42,7 +44,10 @@ class GitHubClient:
                 json={"ref": ref or self.default_branch, "inputs": inputs},
             )
             if resp.status_code not in (200, 201, 204):
-                raise GitHubError(f"dispatch {workflow_file} failed ({resp.status_code}): {resp.text}")
+                raise GitHubError(
+                    f"dispatch {workflow_file} failed ({resp.status_code}): {resp.text}",
+                    status_code=resp.status_code,
+                )
 
     async def list_workflow_runs(self, workflow_file: str, per_page: int = 10) -> list[dict[str, Any]]:
         url = f"{self.base_url}/actions/workflows/{workflow_file}/runs"

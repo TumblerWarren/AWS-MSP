@@ -7,13 +7,18 @@ import logging
 import shutil
 import subprocess
 import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import boto3
+import httpx
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import HTTPException
 from msp_policy import drift_entries, drift_hash, evaluate, fingerprint, redact_plan
+from starlette.concurrency import run_in_threadpool
 
 from ..agents.investigator import investigate_finding
 from ..agents.patcher import patch_terraform_workspace
@@ -177,19 +182,57 @@ class Orchestrator:
             )
         correlation_id = f"scan-{uuid4().hex[:8]}"
         gh = self._gh()
-        await gh.dispatch_workflow(
-            "drift-check.yml",
-            inputs={"correlation_id": correlation_id},
-            ref=ref,
-        )
+        try:
+            await gh.dispatch_workflow(
+                "drift-check.yml",
+                inputs={"correlation_id": correlation_id},
+                ref=ref,
+            )
+        except GitHubError as exc:
+            logger.warning("Drift scan dispatch rejected by GitHub (HTTP %s)", exc.status_code)
+            if exc.status_code in (401, 403, 404):
+                detail = (
+                    f"GitHub rejected the drift scan (HTTP {exc.status_code}). Check that the configured "
+                    "GitHub token can access this repository and has permission to dispatch drift-check.yml "
+                    "(Actions: Read and write for a fine-grained token)."
+                )
+            else:
+                detail = f"GitHub rejected the drift scan (HTTP {exc.status_code}). Check the workflow and branch."
+            raise HTTPException(status_code=502, detail=detail) from exc
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=504, detail="GitHub timed out while dispatching the drift scan.") from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail="Could not reach GitHub to dispatch the drift scan.") from exc
         return {
             "mode": "github_actions",
             "correlation_id": correlation_id,
             "message": f"Dispatched drift-check.yml on {self.settings.github_repo} (correlation={correlation_id}). Click 'Sync GitHub' once the run finishes.",
         }
 
+    def _read_s3_drift_report(self, run_id: int, attempt: int) -> dict[str, Any] | None:
+        repo = self.settings.github_repo.strip().lower()
+        key = f"drift-reports/{repo}/{run_id}/{attempt}.json"
+        try:
+            s3 = boto3.client("s3", region_name=self.settings.aws_region)
+            result = s3.get_object(Bucket=self.settings.drift_report_bucket, Key=key)
+            with closing(result["Body"]) as body:
+                report = json.load(body)
+        except (BotoCoreError, ClientError) as exc:
+            code = exc.response.get("Error", {}).get("Code") if isinstance(exc, ClientError) else type(exc).__name__
+            if code in ("NoSuchKey", "404"):
+                return None
+            logger.warning("S3 drift report read failed for run %s (%s)", run_id, code)
+            raise HTTPException(
+                status_code=502, detail="Could not read the S3 drift report. Check the bucket and AWS permissions."
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="The S3 drift report contains invalid JSON.") from exc
+        if not isinstance(report, dict):
+            raise HTTPException(status_code=502, detail="The S3 drift report has an invalid format.")
+        return report
+
     async def sync_latest_drift_run(self) -> dict[str, Any]:
-        """Fetch the latest completed drift-check.yml artifact from GitHub Actions and ingest it."""
+        """Ingest the latest successful drift report, with support for older GitHub artifacts."""
         if not self.settings.github_configured:
             raise HTTPException(status_code=400, detail="GitHub token/repo not configured.")
         gh = self._gh()
@@ -201,16 +244,19 @@ class Orchestrator:
                 return {"synced": False, "run_id": in_prog["id"], "findings": [], "message": f"drift-check.yml run #{in_prog['run_number']} is still {in_prog['status']}..."}
             raise HTTPException(status_code=404, detail="No completed drift-check.yml runs found on GitHub.")
 
-        artifacts = await gh.list_run_artifacts(completed["id"])
-        drift_art = next((a for a in artifacts if str(a.get("name", "")).startswith("drift-report-")), None)
-        if not drift_art:
-            raise HTTPException(status_code=404, detail=f"No drift-report artifact found in run #{completed['run_number']}.")
-
-        files = await gh.download_artifact_files(drift_art["id"])
+        files = None
+        if self.settings.drift_report_bucket:
+            files = await run_in_threadpool(self._read_s3_drift_report, completed["id"], completed.get("run_attempt") or 1)
+        if files is None:
+            artifacts = await gh.list_run_artifacts(completed["id"])
+            drift_art = next((a for a in artifacts if str(a.get("name", "")).startswith("drift-report-")), None)
+            if not drift_art:
+                raise HTTPException(status_code=404, detail=f"No drift report found for run #{completed['run_number']}.")
+            files = await gh.download_artifact_files(drift_art["id"])
         plan = files.get("plan.redacted.json")
         meta = files.get("meta.json") or {}
-        if not plan:
-            raise HTTPException(status_code=500, detail="plan.redacted.json missing from GitHub artifact.")
+        if not isinstance(plan, dict) or not plan or not isinstance(meta, dict):
+            raise HTTPException(status_code=502, detail="The drift report contains an invalid plan or metadata.")
         findings = self.ingest_plan(plan, meta)
         return {
             "synced": True,
@@ -229,6 +275,10 @@ class Orchestrator:
         if not finding:
             raise HTTPException(status_code=404, detail="Finding not found")
 
+        model_id, region = self.settings.resolve_bedrock_model(
+            self.settings.strands_model_id, self.store.get_model_preferences().investigation
+        )
+        settings = self.settings.model_copy(update={"strands_model_id": model_id, "bedrock_region": region})
         finding.status = "investigating"
         self.store.save_finding(finding)
         self.store.record_audit(
@@ -244,12 +294,12 @@ class Orchestrator:
                 finding_id=finding.id,
                 status="running",
                 engine="strands-bedrock-mcp",
-                model_id=self.settings.strands_model_id,
+                model_id=model_id,
             )
         )
 
         try:
-            report, engine_name, mcp_servers = await investigate_finding(finding, self.settings, tf_context)
+            report, engine_name, mcp_servers = await investigate_finding(finding, settings, tf_context)
             inv.status = "completed"
             inv.engine = engine_name
             inv.mcp_servers_json = json.dumps(mcp_servers)
@@ -450,10 +500,16 @@ class Orchestrator:
                 self._prepare_repo_workspace(work_dir, branch_name)
                 _, resolved_rel = _resolve_tf_dir(work_dir, finding.root_dir)
                 finding.root_dir = resolved_rel
+                patcher_settings = self.settings
+                if self.settings.claude_use_bedrock:
+                    model_id, region = self.settings.resolve_bedrock_model(
+                        self.settings.claude_model, self.store.get_model_preferences().patcher
+                    )
+                    patcher_settings = self.settings.model_copy(update={"claude_model": model_id, "bedrock_region": region})
                 patch = await patch_terraform_workspace(
                     repo_dir=work_dir,
                     finding=finding,
-                    settings=self.settings,
+                    settings=patcher_settings,
                     extra_instructions=extra_instructions,
                 )
                 rem.patch_summary = patch.summary

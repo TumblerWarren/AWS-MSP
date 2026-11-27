@@ -144,9 +144,20 @@ class AuditEvent(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class ModelPreferences(SQLModel, table=True):
+    id: int = Field(default=1, primary_key=True)
+    investigation: str | None = None
+    patcher: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # API Request / Response DTOs
 # ---------------------------------------------------------------------------
+
+
+class UpdateModelsRequest(BaseModel):
+    investigation: str | None
+    patcher: str | None
 
 
 class IngestPlanRequest(BaseModel):

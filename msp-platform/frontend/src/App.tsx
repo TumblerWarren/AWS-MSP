@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   CheckCircle2,
+  Cpu,
   KeyRound,
   Play,
   RefreshCw,
@@ -12,7 +13,7 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import { FindingDetailView } from "./components/FindingDetail";
-import type { FindingDetail, FindingSummary, PlatformConfig } from "./types";
+import type { FindingDetail, FindingSummary, ModelPreferences, PlatformConfig } from "./types";
 
 const sevDot: Record<string, string> = {
   critical: "bg-red-500",
@@ -20,6 +21,11 @@ const sevDot: Record<string, string> = {
   medium: "bg-amber-400",
   low: "bg-zinc-500",
 };
+
+const modelFields = [
+  { key: "investigation", label: "Investigation model" },
+  { key: "patcher", label: "Terraform patch model" },
+] as const;
 
 export function App() {
   const [config, setConfig] = useState<PlatformConfig | null>(null);
@@ -31,6 +37,7 @@ export function App() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [banner, setBanner] = useState<{ kind: "info" | "error"; text: string } | null>(null);
   const [showCreds, setShowCreds] = useState(false);
+  const [modelForm, setModelForm] = useState<ModelPreferences | null>(null);
   const [credForm, setCredForm] = useState({
     aws_access_key_id: "",
     aws_secret_access_key: "",
@@ -93,10 +100,14 @@ export function App() {
     }
   }
 
+  const modelsChanged = config && modelForm && modelFields.some(
+    ({ key }) => modelForm[key] !== config.model_preferences[key],
+  );
+
   return (
     <div className="min-h-screen flex flex-col bg-[#09090b] text-zinc-100">
       {/* Top Navbar */}
-      <header className="h-13 border-b border-zinc-800/90 bg-[#0b0b0e] px-4 flex items-center justify-between gap-4 sticky top-0 z-20">
+      <header className="min-h-13 border-b border-zinc-800/90 bg-[#0b0b0e] flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-4 py-2 sticky top-0 z-20">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
             <div className="w-6 h-6 rounded-md bg-emerald-500/15 border border-emerald-500/40 flex items-center justify-center">
@@ -107,7 +118,7 @@ export function App() {
           </div>
 
           {config && (
-            <div className="hidden md:flex items-center gap-2 pl-3 border-l border-zinc-800 font-mono text-[11px]">
+            <div className="hidden xl:flex items-center gap-2 pl-3 border-l border-zinc-800 font-mono text-[11px]">
               <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 ${config.github_configured ? "border-emerald-500/30 text-emerald-300 bg-emerald-500/5" : "border-zinc-800 text-zinc-400 bg-zinc-900"}`}>
                 <span className={`w-1.5 h-1.5 rounded-full ${config.github_configured ? "bg-emerald-400" : "bg-zinc-500"}`} />
                 {config.github_configured ? config.github_repo : "GitHub: local mode"}
@@ -122,7 +133,7 @@ export function App() {
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => {
               if (config) {
@@ -138,6 +149,18 @@ export function App() {
           >
             <KeyRound className="w-3.5 h-3.5 text-amber-400" />
             AWS Credentials
+          </button>
+
+          <button
+            type="button"
+            aria-expanded={modelForm !== null}
+            aria-controls="model-settings"
+            disabled={!config?.model_preferences || busyAction === "models"}
+            onClick={() => setModelForm(modelForm ? null : config?.model_preferences ?? null)}
+            className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800 aria-expanded:bg-zinc-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400 disabled:opacity-50 cursor-pointer"
+          >
+            <Cpu className="w-3.5 h-3.5" aria-hidden="true" />
+            AI Models
           </button>
 
           <button
@@ -181,6 +204,7 @@ export function App() {
 
       {banner && (
         <div
+          role={banner.kind === "error" ? "alert" : "status"}
           className={`px-4 py-2 text-xs font-mono border-b flex items-center justify-between ${
             banner.kind === "error"
               ? "bg-red-950/30 border-red-500/30 text-red-300"
@@ -192,6 +216,60 @@ export function App() {
             dismiss
           </button>
         </div>
+      )}
+
+      {config && modelForm && (
+        <section id="model-settings" aria-labelledby="model-settings-title" className="border-b border-zinc-800 bg-[#111114] px-4 py-4">
+          <form
+            className="mx-auto max-w-4xl space-y-4"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!modelsChanged || busyAction !== null) return;
+              void runAction("models", async () => {
+                const updated = await api.updateModels(modelForm);
+                setConfig(updated);
+                setModelForm(null);
+                setBanner({ kind: "info", text: "Model choices saved for new investigations and Terraform patches." });
+              });
+            }}
+          >
+            <h2 id="model-settings-title" className="text-sm font-semibold text-zinc-100">AI model settings</h2>
+            <div className="grid gap-4 sm:grid-cols-2">
+              {modelFields.map(({ key, label }) => {
+                const activeId = key === "investigation" ? config.strands_model_id : config.claude_model;
+                const activeLabel = config.bedrock_models.find((model) => model.id === activeId)?.label ?? activeId;
+                const usesBedrock = key === "investigation" || config.claude_use_bedrock;
+                return (
+                  <div key={key} className="min-w-0 space-y-1.5">
+                    <label htmlFor={`model-${key}`} className="block text-xs font-medium text-zinc-200">{label}</label>
+                    <select
+                      id={`model-${key}`}
+                      aria-describedby={`model-${key}-active`}
+                      value={modelForm[key] ?? ""}
+                      disabled={!usesBedrock || busyAction === "models"}
+                      onChange={(event) => setModelForm({ ...modelForm, [key]: event.target.value || null })}
+                      className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 [color-scheme:dark] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400 disabled:opacity-60"
+                    >
+                      <option value="">Deployment default</option>
+                      {usesBedrock && config.bedrock_models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                    </select>
+                    <p id={`model-${key}-active`} className="break-words text-xs text-zinc-400">
+                      {usesBedrock ? `Active model · ${activeLabel}` : `Configured by the deployment · ${activeId}`}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="flex justify-end gap-2">
+              <button type="button" disabled={busyAction === "models"} onClick={() => setModelForm(null)} className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400 disabled:opacity-60 cursor-pointer">
+                Cancel
+              </button>
+              <button type="submit" disabled={!modelsChanged || busyAction !== null} className="rounded-md bg-emerald-500 px-3.5 py-1.5 text-xs font-semibold text-zinc-950 hover:bg-emerald-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400 disabled:opacity-50 cursor-pointer">
+                {busyAction === "models" ? "Saving…" : "Save models"}
+              </button>
+            </div>
+          </form>
+        </section>
       )}
 
       {/* Workspace: Left Drift Inbox + Right Finding Detail */}

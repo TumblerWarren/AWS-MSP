@@ -1,4 +1,4 @@
-import type { FindingDetail, FindingSummary, PlatformConfig, Remediation } from "./types";
+import type { FindingDetail, FindingSummary, ModelPreferences, PlatformConfig, Remediation } from "./types";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -20,6 +20,10 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   config: () => req<PlatformConfig>("/api/config"),
+  updateModels: (preferences: ModelPreferences) => req<PlatformConfig>("/api/config/models", {
+    method: "PUT",
+    body: JSON.stringify(preferences),
+  }),
   updateCredentials: (payload: {
     aws_access_key_id?: string;
     aws_secret_access_key?: string;

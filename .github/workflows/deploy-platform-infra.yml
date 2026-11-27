@@ -98,6 +98,8 @@ jobs:
             echo "  \`$ROLE_ARN\`"
             echo "- **ECR Repository**:"
             echo "  \`$(terraform output -raw ecr_repository_url)\`"
+            echo "- **Drift report bucket**:"
+            echo "  \`$(terraform output -raw drift_report_bucket)\`"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ inputs.host_on_aws_fargate }}" = "true" ]; then
             echo "Waiting for ECS Fargate service rollout to stabilize..."

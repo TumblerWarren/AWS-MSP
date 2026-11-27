@@ -43,8 +43,9 @@ variable "state_bucket_name" {
 }
 
 locals {
-  bucket_name = var.state_bucket_name != "" ? var.state_bucket_name : "msp-sandbox-tfstate-${data.aws_caller_identity.current.account_id}"
-  repo_parts  = split("/", var.github_repo)
+  bucket_name             = var.state_bucket_name != "" ? var.state_bucket_name : "msp-sandbox-tfstate-${data.aws_caller_identity.current.account_id}"
+  drift_report_bucket_arn = "arn:aws:s3:::msp-drift-reports-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
+  repo_parts              = split("/", var.github_repo)
   allowed_subs = compact([
     "repo:${var.github_repo}:*",
     "repo:${local.repo_parts[0]}@*/${local.repo_parts[1]}@*:*",
@@ -163,6 +164,31 @@ data "aws_iam_policy_document" "ci_terraform_permissions" {
       "kms:DescribeKey"
     ]
     resources = ["*"]
+  }
+
+  statement {
+    sid = "ManageDriftReportBucket"
+    actions = [
+      "s3:CreateBucket",
+      "s3:DeleteBucket",
+      "s3:ListBucket",
+      "s3:GetBucket*",
+      "s3:GetAccelerateConfiguration",
+      "s3:GetEncryptionConfiguration",
+      "s3:GetLifecycleConfiguration",
+      "s3:GetReplicationConfiguration",
+      "s3:PutBucketTagging",
+      "s3:PutBucketPublicAccessBlock",
+      "s3:PutEncryptionConfiguration",
+      "s3:PutLifecycleConfiguration"
+    ]
+    resources = [local.drift_report_bucket_arn]
+  }
+
+  statement {
+    sid       = "PublishDriftReports"
+    actions   = ["s3:PutObject"]
+    resources = ["${local.drift_report_bucket_arn}/drift-reports/*"]
   }
 }
 

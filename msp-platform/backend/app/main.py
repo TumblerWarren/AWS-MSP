@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import Settings, get_settings
+from .config import BEDROCK_MODELS, Settings, get_settings
 from .models import (
     AuditEvent,
     DecisionRequest,
@@ -22,6 +22,7 @@ from .models import (
     Remediation,
     TriggerScanRequest,
     UpdateCredentialsRequest,
+    UpdateModelsRequest,
     VerifyRequest,
 )
 from .services.aws_session import aws_credential_mode, has_aws_credentials
@@ -201,6 +202,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/config")
     def platform_config() -> dict[str, Any]:
+        preferences = store.get_model_preferences()
+        investigation = preferences.investigation if preferences.investigation in BEDROCK_MODELS else None
+        patcher = preferences.patcher if cfg.claude_use_bedrock and preferences.patcher in BEDROCK_MODELS else None
+        investigation_id, _ = cfg.resolve_bedrock_model(cfg.strands_model_id, investigation)
+        patcher_id, _ = cfg.resolve_bedrock_model(cfg.claude_model, patcher)
         return {
             "github_configured": cfg.github_configured,
             "github_repo": cfg.github_repo,
@@ -209,11 +215,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "aws_credential_mode": aws_credential_mode(),
             "investigator_role_configured": bool(cfg.investigator_role_arn),
             "investigator_role_arn": cfg.investigator_role_arn,
-            "strands_model_id": cfg.strands_model_id,
-            "claude_model": cfg.claude_model,
+            "strands_model_id": investigation_id,
+            "claude_model": patcher_id,
             "claude_use_bedrock": cfg.claude_use_bedrock,
             "aws_mcp_enabled": cfg.aws_mcp_enabled,
+            "model_preferences": {"investigation": investigation, "patcher": patcher},
+            "bedrock_models": [{"id": model_id, "label": label} for model_id, (label, _) in BEDROCK_MODELS.items()],
         }
+
+    @app.put("/api/config/models")
+    def update_models(body: UpdateModelsRequest) -> dict[str, Any]:
+        if body.investigation is not None and body.investigation not in BEDROCK_MODELS:
+            raise HTTPException(status_code=422, detail="Choose a supported investigation model.")
+        if body.patcher is not None and (not cfg.claude_use_bedrock or body.patcher not in BEDROCK_MODELS):
+            raise HTTPException(status_code=422, detail="Choose a supported Bedrock patching model or use the deployment default.")
+        store.save_model_preferences(body.investigation, body.patcher)
+        return platform_config()
 
     @app.post("/api/config/credentials")
     def update_credentials(body: UpdateCredentialsRequest) -> dict[str, Any]:
