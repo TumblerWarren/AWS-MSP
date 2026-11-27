@@ -50,10 +50,26 @@ jobs:
       - name: Apply IAM roles & ECR
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform apply -input=false -auto-approve \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="state_bucket_arn=arn:aws:s3:::${{ vars.TF_STATE_BUCKET }}" \
-            -var="deploy_ecs_service=false"
+          if [ "${{ inputs.host_on_aws_fargate }}" = "true" ]; then
+            terraform apply -input=false -auto-approve \
+              -target=aws_ecr_repository.platform \
+              -target=aws_cloudwatch_log_group.platform \
+              -target=aws_iam_role.ecs_execution \
+              -target=aws_iam_role_policy_attachment.ecs_execution_default \
+              -target=aws_iam_role.platform_task \
+              -target=aws_iam_role.investigator_readonly \
+              -target=aws_iam_role_policy_attachment.readonly \
+              -target=aws_iam_role_policy_attachment.cloudtrail_readonly \
+              -target=aws_iam_role_policy.investigator_guardrails \
+              -target=aws_iam_role_policy.platform_task_permissions \
+              -var="aws_region=${{ env.AWS_REGION }}" \
+              -var="state_bucket_arn=arn:aws:s3:::${{ vars.TF_STATE_BUCKET }}"
+          else
+            terraform apply -input=false -auto-approve \
+              -var="aws_region=${{ env.AWS_REGION }}" \
+              -var="state_bucket_arn=arn:aws:s3:::${{ vars.TF_STATE_BUCKET }}" \
+              -var="deploy_ecs_service=false"
+          fi
 
       - name: Build & Push Docker image + Enable ECS Fargate (Future AWS Hosting)
         if: ${{ inputs.host_on_aws_fargate == true }}
