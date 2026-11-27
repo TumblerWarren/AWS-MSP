@@ -255,6 +255,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def trigger_scan(body: TriggerScanRequest, o: Orchestrator = Depends(get_orch)) -> dict[str, Any]:
         return await o.trigger_scan(ref=body.ref)
 
+    @app.post("/api/scans/sync")
+    async def sync_latest_scan(o: Orchestrator = Depends(get_orch), s: Store = Depends(get_store)) -> dict[str, Any]:
+        res = await o.sync_latest_drift_run()
+        return {
+            "synced": res["synced"],
+            "run_id": res["run_id"],
+            "run_url": res.get("run_url"),
+            "message": res["message"],
+            "findings": [_serialize_finding(s, f) for f in res.get("findings", [])],
+        }
+
     @app.post("/api/scans/ingest")
     def ingest_plan(
         body: IngestPlanRequest,

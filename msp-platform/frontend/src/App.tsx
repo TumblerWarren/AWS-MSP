@@ -171,6 +171,22 @@ export function App() {
             Run Drift Scan
           </button>
 
+          {config?.github_configured && (
+            <button
+              onClick={() =>
+                runAction("sync", async () => {
+                  const res = await api.syncGitHub();
+                  await refreshList(false);
+                  setBanner({ kind: "info", text: res.message });
+                })
+              }
+              disabled={busyAction !== null}
+              className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50 cursor-pointer"
+            >
+              Sync GitHub
+            </button>
+          )}
+
           <button
             onClick={() => runAction("refresh", () => refreshList())}
             className="rounded-md border border-zinc-800 p-1.5 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900 cursor-pointer"

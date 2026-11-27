@@ -44,8 +44,10 @@ variable "state_bucket_name" {
 
 locals {
   bucket_name = var.state_bucket_name != "" ? var.state_bucket_name : "msp-sandbox-tfstate-${data.aws_caller_identity.current.account_id}"
+  repo_parts  = split("/", var.github_repo)
   allowed_subs = compact([
     "repo:${var.github_repo}:*",
+    "repo:${local.repo_parts[0]}@*/${local.repo_parts[1]}@*:*",
     var.platform_github_repo != "" ? "repo:${var.platform_github_repo}:*" : ""
   ])
 }

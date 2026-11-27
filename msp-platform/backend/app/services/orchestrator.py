@@ -202,7 +202,39 @@ class Orchestrator:
         return {
             "mode": "github_actions",
             "correlation_id": correlation_id,
-            "message": f"Dispatched drift-check.yml on {self.settings.github_repo} (correlation={correlation_id}).",
+            "message": f"Dispatched drift-check.yml on {self.settings.github_repo} (correlation={correlation_id}). Click 'Sync GitHub' once the run finishes.",
+        }
+
+    async def sync_latest_drift_run(self) -> dict[str, Any]:
+        """Fetch the latest completed drift-check.yml artifact from GitHub Actions and ingest it."""
+        if not self.settings.github_configured:
+            raise HTTPException(status_code=400, detail="GitHub token/repo not configured.")
+        gh = self._gh()
+        runs = await gh.list_workflow_runs("drift-check.yml", per_page=10)
+        completed = next((r for r in runs if r.get("status") == "completed" and r.get("conclusion") == "success"), None)
+        if not completed:
+            in_prog = next((r for r in runs if r.get("status") != "completed"), None)
+            if in_prog:
+                return {"synced": False, "run_id": in_prog["id"], "findings": [], "message": f"drift-check.yml run #{in_prog['run_number']} is still {in_prog['status']}..."}
+            raise HTTPException(status_code=404, detail="No completed drift-check.yml runs found on GitHub.")
+
+        artifacts = await gh.list_run_artifacts(completed["id"])
+        drift_art = next((a for a in artifacts if str(a.get("name", "")).startswith("drift-report-")), None)
+        if not drift_art:
+            raise HTTPException(status_code=404, detail=f"No drift-report artifact found in run #{completed['run_number']}.")
+
+        files = await gh.download_artifact_files(drift_art["id"])
+        plan = files.get("plan.redacted.json")
+        meta = files.get("meta.json") or {}
+        if not plan:
+            raise HTTPException(status_code=500, detail="plan.redacted.json missing from GitHub artifact.")
+        findings = self.ingest_plan(plan, meta)
+        return {
+            "synced": True,
+            "run_id": completed["id"],
+            "run_url": completed.get("html_url"),
+            "findings": findings,
+            "message": f"Synced run #{completed['run_number']}: ingested {len(findings)} drift finding(s) from AWS.",
         }
 
     # ------------------------------------------------------------------
