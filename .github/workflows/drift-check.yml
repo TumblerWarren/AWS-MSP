@@ -57,8 +57,8 @@ jobs:
           terraform state pull | python3 -c '
           import json, sys
           s = json.load(sys.stdin)
-          print(f"serial={s.get(\"serial\", \"\")}")
-          print(f"lineage={s.get(\"lineage\", \"\")}")
+          print("serial={}".format(s.get("serial", "")))
+          print("lineage={}".format(s.get("lineage", "")))
           ' >> "$GITHUB_OUTPUT"
 
       - name: Terraform Refresh-Only Plan
