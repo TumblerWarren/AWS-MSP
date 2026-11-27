@@ -18,7 +18,6 @@ from msp_policy import drift_entries, drift_hash, evaluate, fingerprint, redact_
 from ..agents.investigator import investigate_finding
 from ..agents.patcher import patch_terraform_workspace
 from ..config import Settings
-from ..demo_fixtures import combined_demo_plan
 from ..models import Finding, Investigation, Remediation
 from ..services.github_client import GitHubClient, GitHubError
 from ..store import Store
@@ -170,29 +169,13 @@ class Orchestrator:
             saved.append(finding)
         return saved
 
-    def seed_demo(self) -> list[Finding]:
-        return self.ingest_plan(
-            combined_demo_plan(),
-            meta={
-                "account_id": "111122223333",
-                "region": self.settings.aws_region,
-                "repo": self.settings.github_repo or "msp-sandbox-infra",
-                "root_dir": "infra",
-                "commit_sha": "7d4e9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f",
-                "state_serial": 14,
-                "state_lineage": "sandbox-lineage-001",
-            },
-        )
-
     async def trigger_scan(self, ref: str | None = None) -> dict[str, Any]:
-        correlation_id = f"scan-{uuid4().hex[:8]}"
         if not self.settings.github_configured:
-            findings = self.seed_demo()
-            return {
-                "mode": "local_preview",
-                "correlation_id": correlation_id,
-                "message": f"GitHub not configured yet; loaded {len(findings)} local demo drift finding(s).",
-            }
+            raise HTTPException(
+                status_code=400,
+                detail="GitHub token/repo not configured. Set MSP_GITHUB_TOKEN (or MSP_GITHUB_PAT in GitHub Secrets).",
+            )
+        correlation_id = f"scan-{uuid4().hex[:8]}"
         gh = self._gh()
         await gh.dispatch_workflow(
             "drift-check.yml",

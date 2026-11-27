@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   CheckCircle2,
-  Database,
   KeyRound,
   Play,
   RefreshCw,
@@ -143,21 +142,6 @@ export function App() {
 
           <button
             onClick={() =>
-              runAction("seed", async () => {
-                const res = await api.seedDemo();
-                await refreshList(false);
-                setBanner({ kind: "info", text: `Loaded ${res.created} sandbox drift scenario(s) (SG, EC2, RDS).` });
-              })
-            }
-            disabled={busyAction !== null}
-            className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800 disabled:opacity-50 cursor-pointer"
-          >
-            <Database className="w-3.5 h-3.5 text-zinc-400" />
-            Load Demo Drift
-          </button>
-
-          <button
-            onClick={() =>
               runAction("scan", async () => {
                 const res = await api.triggerScan();
                 await refreshList();
@@ -171,21 +155,19 @@ export function App() {
             Run Drift Scan
           </button>
 
-          {config?.github_configured && (
-            <button
-              onClick={() =>
-                runAction("sync", async () => {
-                  const res = await api.syncGitHub();
-                  await refreshList(false);
-                  setBanner({ kind: "info", text: res.message });
-                })
-              }
-              disabled={busyAction !== null}
-              className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50 cursor-pointer"
-            >
-              Sync GitHub
-            </button>
-          )}
+          <button
+            onClick={() =>
+              runAction("sync", async () => {
+                const res = await api.syncGitHub();
+                await refreshList(false);
+                setBanner({ kind: "info", text: res.message });
+              })
+            }
+            disabled={busyAction !== null}
+            className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50 cursor-pointer"
+          >
+            Sync GitHub
+          </button>
 
           <button
             onClick={() => runAction("refresh", () => refreshList())}
@@ -258,8 +240,9 @@ export function App() {
                 <Terminal className="w-6 h-6 text-zinc-600 mx-auto" />
                 <div className="text-xs font-medium text-zinc-300">No drift findings</div>
                 <p className="text-[11px] text-zinc-500">
-                  Click <span className="text-zinc-300">Load Demo Drift</span> to test locally, or{" "}
-                  <span className="text-zinc-300">Run Drift Scan</span> once GitHub is connected.
+                  Click <span className="text-zinc-300">Run Drift Scan</span> to dispatch{" "}
+                  <code className="text-zinc-300">drift-check.yml</code>, or{" "}
+                  <span className="text-zinc-300">Sync GitHub</span> to pull the latest run.
                 </p>
               </div>
             ) : (

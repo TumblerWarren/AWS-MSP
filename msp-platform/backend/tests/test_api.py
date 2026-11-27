@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.agents.patcher import PatchResult
 from app.config import Settings
-from app.demo_fixtures import clean_plan, rds_retention_drift_plan
+from app.demo_fixtures import clean_plan, combined_demo_plan, rds_retention_drift_plan
 from app.main import create_app
 from app.models import EvidenceItem, ImpactedResource, InvestigationReport
 
@@ -65,8 +65,11 @@ def _mock_sg_report() -> InvestigationReport:
 
 def test_full_restore_and_verify_lifecycle(tmp_path: Path):
     with _make_client(tmp_path) as client:
-        # 1. Seed demo drift findings (SG, EC2, RDS)
-        r = client.post("/api/demo/seed")
+        # 1. Ingest drift plan (SG, EC2, RDS)
+        r = client.post(
+            "/api/scans/ingest",
+            json={"plan": combined_demo_plan(), "meta": {"account_id": "111122223333"}},
+        )
         assert r.status_code == 200
         findings = r.json()["findings"]
         assert len(findings) == 3
@@ -112,7 +115,10 @@ def test_full_restore_and_verify_lifecycle(tmp_path: Path):
 
 def test_update_terraform_flow_opens_patch(tmp_path: Path):
     with _make_client(tmp_path) as client:
-        r = client.post("/api/demo/seed")
+        r = client.post(
+            "/api/scans/ingest",
+            json={"plan": combined_demo_plan(), "meta": {"account_id": "111122223333"}},
+        )
         ec2 = next(f for f in r.json()["findings"] if f["address"] == "aws_instance.app")
 
         fake_patch = PatchResult(
@@ -160,7 +166,10 @@ def test_negative_safety_rds_replace_is_blocked(tmp_path: Path):
 def test_agentcore_ping_and_invocations_endpoint(tmp_path: Path):
     with _make_client(tmp_path) as client:
         assert client.get("/ping").json() == {"status": "Healthy"}
-        seed = client.post("/api/demo/seed").json()["findings"]
+        seed = client.post(
+            "/api/scans/ingest",
+            json={"plan": combined_demo_plan(), "meta": {"account_id": "111122223333"}},
+        ).json()["findings"]
         sg_id = next(f["id"] for f in seed if f["address"] == "aws_security_group.app")
 
         with patch(

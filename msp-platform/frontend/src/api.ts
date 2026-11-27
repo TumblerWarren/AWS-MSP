@@ -35,7 +35,6 @@ export const api = {
     }),
   listFindings: () => req<FindingSummary[]>("/api/findings"),
   getFinding: (id: string) => req<FindingDetail>(`/api/findings/${id}`),
-  seedDemo: () => req<{ created: number; findings: FindingSummary[] }>("/api/demo/seed", { method: "POST" }),
   triggerScan: () => req<{ mode: string; correlation_id: string; message: string }>("/api/scans/trigger", {
     method: "POST",
     body: JSON.stringify({}),

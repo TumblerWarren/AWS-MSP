@@ -246,11 +246,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Finding not found")
         return _serialize_finding(s, f, full=True)
 
-    @app.post("/api/demo/seed")
-    def seed_demo(o: Orchestrator = Depends(get_orch), s: Store = Depends(get_store)) -> dict[str, Any]:
-        findings = o.seed_demo()
-        return {"created": len(findings), "findings": [_serialize_finding(s, f) for f in findings]}
-
     @app.post("/api/scans/trigger")
     async def trigger_scan(body: TriggerScanRequest, o: Orchestrator = Depends(get_orch)) -> dict[str, Any]:
         return await o.trigger_scan(ref=body.ref)

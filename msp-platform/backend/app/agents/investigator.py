@@ -156,56 +156,6 @@ def _run_strands_sync(
         return report, engine, mcp_names
 
 
-def _offline_preview_report(finding: Finding) -> InvestigationReport:
-    """Returned only when no AWS credentials exist on this machine yet."""
-    changes = json.loads(finding.changes_json or "[]")
-    changed_paths = ", ".join(c.get("path", "?") for c in changes) or finding.drift_kind
-    is_ssh = finding.resource_type == "aws_security_group" and "0.0.0.0/0" in json.dumps(changes)
-    recommended = "restore" if is_ssh else "needs_review"
-
-    return InvestigationReport(
-        headline=f"[Offline Preview] Drift on {finding.address} ({changed_paths})",
-        severity="critical" if is_ssh else finding.severity,  # type: ignore[arg-type]
-        summary=(
-            f"No AWS credentials were detected on this machine, so live Strands/Bedrock + AWS MCP "
-            f"investigation did not run. Terraform detected drift on `{finding.address}` "
-            f"({finding.resource_id or 'no-id'}) affecting: {changed_paths}."
-        ),
-        root_cause="Configure temporary AWS credentials (with Bedrock access) to query CloudTrail and live AWS via MCP.",
-        actor="Unavailable (offline preview)",
-        event_time=None,
-        event_name=None,
-        blast_radius_summary=(
-            "Configure AWS credentials to inspect live attached ENIs, EC2 instances, and RDS security group references."
-        ),
-        impacted_resources=[
-            ImpactedResource(
-                resource_id=finding.resource_id or finding.address,
-                resource_type=finding.resource_type,
-                relationship="Drifted resource",
-                risk="critical" if is_ssh else "medium",
-            )
-        ],
-        recommended_action=recommended,  # type: ignore[arg-type]
-        recommendation_rationale=(
-            "Security group exposes 0.0.0.0/0; restoring AWS is recommended once verified."
-            if is_ssh
-            else "Review the diff and choose Restore AWS or Update Terraform."
-        ),
-        confidence=0.35,
-        evidence_timeline=[
-            EvidenceItem(
-                source="Terraform Plan (Redacted)",
-                summary=f"Detected {len(changes)} attribute diff(s) on {finding.address}.",
-                raw_ref=finding.fingerprint[:12],
-            )
-        ],
-        open_questions=[
-            "Run with temporary AWS IAM credentials to enable live CloudTrail + AWS API MCP investigation."
-        ],
-    )
-
-
 async def investigate_finding(
     finding: Finding,
     settings: Settings,
@@ -213,7 +163,9 @@ async def investigate_finding(
 ) -> tuple[InvestigationReport, str, list[str]]:
     """Investigate a drift finding using Strands Agents SDK + official AWS Labs MCP servers."""
     if not has_aws_credentials():
-        logger.info("No AWS credentials detected; returning offline preview report for %s.", finding.id)
-        return _offline_preview_report(finding), "offline-preview", []
+        raise RuntimeError(
+            "No AWS credentials detected. Configure AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY "
+            "(or attach an ECS Task Role) to run live Strands + AWS MCP investigation."
+        )
 
     return await asyncio.to_thread(_run_strands_sync, finding, settings, tf_context)
