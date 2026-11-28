@@ -16,15 +16,23 @@ def _check_workspace(verify: bool = False) -> None:
     env = os.environ
     account = subprocess.check_output(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"], text=True).strip()
     state = json.loads(subprocess.check_output(["terraform", "state", "pull"], stderr=subprocess.DEVNULL))
-    actual = (account, env["AWS_REGION"], env["TF_WORKING_DIR"], env["GITHUB_SHA"], state.get("lineage"), str(state.get("serial")))
-    expected = tuple(env[f"EXPECTED_{key}"] for key in ("ACCOUNT", "REGION", "ROOT", "COMMIT", "LINEAGE", "SERIAL"))
-    matches = actual[:-1] == expected[:-1] if verify else actual == expected
-    if not matches:
-        raise SystemExit("Workspace, revision, or state changed. Sync a fresh scan and review again.")
+    keys = ("ACCOUNT", "REGION", "ROOT", "COMMIT", "LINEAGE", "SERIAL")
+    actual = (account, env["AWS_REGION"], env["TF_WORKING_DIR"], env["GITHUB_SHA"], state.get("lineage") or "", str(state.get("serial", "")))
+    expected = tuple(env[f"EXPECTED_{key}"] for key in keys)
+    pairs = list(zip(keys, expected, actual))
+    checked = pairs[:-1] if verify else pairs
+    mismatches = [f"{k} (expected={exp!r}, actual={act!r})" for k, exp, act in checked if exp != act]
+    if mismatches:
+        raise SystemExit(
+            "Workspace, revision, or state changed [" + "; ".join(mismatches) + "]. Sync a fresh scan and review again."
+        )
     if not verify:
         head = subprocess.check_output(["git", "ls-remote", "--refs", "origin", env["GITHUB_REF"]], text=True).split()
         if not head or head[0] != env["EXPECTED_COMMIT"]:
-            raise SystemExit("The reviewed Git branch moved. Sync a fresh scan and review again.")
+            raise SystemExit(
+                f"The reviewed Git branch moved (expected={env['EXPECTED_COMMIT']!r}, head={(head[0] if head else None)!r}). "
+                "Sync a fresh scan and review again."
+            )
 
 
 def _compare(reviewed_path: str, fresh_path: str) -> None:
