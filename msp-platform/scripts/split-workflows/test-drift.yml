@@ -1,0 +1,21 @@
+name: Inject Sandbox Test Drift
+
+on:
+  workflow_dispatch:
+__DRIFT_OPTIONS__
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  inject-drift:
+    uses: ./.github/workflows/terraform-lifecycle.yml
+    with:
+      operation: drift
+      drift_scenario: __DRIFT_SCENARIO__
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_CI_ROLE_ARN: ${{ secrets.AWS_CI_ROLE_ARN }}

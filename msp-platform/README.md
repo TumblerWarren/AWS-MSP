@@ -39,3 +39,9 @@ The three split sandbox roots use their own backend keys under `split-sandbox/` 
 3. Run and sync a fresh scan before requesting a restore. The plan/apply workflow uses a saved binary plan in private S3 for at most one day, verifies its checksum, and compares the live plan again after approval. The app reads only redacted S3 reports. The existing sandbox repository remains registered through `MSP_GITHUB_REPO`.
 
 To regenerate the starter repositories locally, run `python msp-platform/scripts/export_split_repos.py <empty-destination>` from the platform repository.
+
+### Test drift across repositories
+
+After deploying the split sandbox, run **Inject Sandbox Test Drift** in two or three repositories. It changes the application security group’s `Tier` tag in networking, the instance’s `Owner` tag in EC2, or the RDS instance’s `Service` tag in database. Then run **Run Drift Scan** and **Sync GitHub**. Check that each repo has its own workspace group and restore plan. After approving and verifying a restore, check that its tag is back to the Terraform value and the other workspace findings are still open.
+
+Select `configuration` in EC2 to enable termination protection or in networking to change the existing HTTPS ingress rule’s description. The networking test preserves protocol, ports, and CIDRs. Restore EC2 termination protection to its Terraform value before destroying the EC2 stack.

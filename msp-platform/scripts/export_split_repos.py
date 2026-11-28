@@ -40,6 +40,20 @@ def export_lifecycle(repo: Path, component: str) -> None:
         content = template.read_text(encoding="utf-8")
         content = content.replace("__TARGET_REPOSITORY__", f"msp-{component}")
         content = content.replace("__STATE_KEY__", f"split-sandbox/{component}/terraform.tfstate")
+        if template.name == "test-drift.yml":
+            options = ""
+            scenario = "tag"
+            if component != "database":
+                options = """    inputs:
+      scenario:
+        description: Choose tag drift or a resource configuration change
+        type: choice
+        default: tag
+        options:
+          - tag
+          - configuration"""
+                scenario = "${{ inputs.scenario }}"
+            content = content.replace("__DRIFT_OPTIONS__", options).replace("__DRIFT_SCENARIO__", scenario)
         write(repo / ".github/workflows" / template.name, content)
 
 
@@ -73,6 +87,8 @@ def export(destination: Path) -> None:
             original = read("compute_and_rds.tf")
             resources = original.split('resource "aws_db_subnet_group"', 1)
             compute = resources[0].strip() + "\n" if is_ec2 else 'resource "aws_db_subnet_group"' + resources[1]
+            if is_ec2:
+                compute = compute.replace("  associate_public_ip_address = false\n", "  associate_public_ip_address = false\n  disable_api_termination     = false\n")
             for name in ("private_a", "private_b"):
                 compute = compute.replace(f"aws_subnet.{name}.id", f"data.aws_subnet.{name}.id")
             for name in ("app", "rds"):
@@ -102,6 +118,11 @@ def network_lookups(is_ec2: bool) -> str:
 
 
 def repository_readme(component: str) -> str:
+    scenario = {
+        "networking": "Choose `configuration` to change the existing IPv4 HTTPS ingress rule’s description while preserving ports and CIDRs.",
+        "ec2": "Choose `configuration` to enable instance termination protection. Restore the setting to its Terraform value before destroying the instance.",
+        "database": "The database workflow injects tag drift.",
+    }[component]
     return f'''# MSP {component.capitalize()} sandbox
 
 Terraform root: `infra/`. State key: `split-sandbox/{component}/terraform.tfstate`.
@@ -113,6 +134,8 @@ Use **Deploy Sandbox Infrastructure** in GitHub Actions to provision a new sandb
 Set the repository variables `AWS_ACCOUNT_ID`, `TF_STATE_BUCKET`, and `AWS_REGION`, and configure CI AWS credentials. Create a protected `sandbox` GitHub environment, restrict it to `main`, and verify that it enforces human approval before setting `MSP_ENABLE_LIFECYCLE=true` or `MSP_ENABLE_RESTORE=true`. Drift Check publishes redacted reports to the MSP S3 bucket.
 
 Use **Destroy Sandbox Infrastructure** on `main` with the exact confirmation `destroy msp-{component}`. Destroy EC2 and database before networking. The lifecycle workflows use this repository’s state key and check the configured AWS account before running Terraform.
+
+After provisioning, run **Inject Sandbox Test Drift** on `main`. The default changes a Terraform-managed tag. {scenario} Run **Drift Check** or the platform’s **Run Drift Scan**, then sync the report and review a restore.
 '''
 
 

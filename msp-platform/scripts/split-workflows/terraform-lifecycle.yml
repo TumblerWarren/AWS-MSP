@@ -9,6 +9,9 @@ on:
       confirmation:
         type: string
         default: ''
+      drift_scenario:
+        type: string
+        default: tag
     secrets:
       AWS_ACCESS_KEY_ID:
         required: false
@@ -30,6 +33,7 @@ env:
   TF_WORKSPACE: default
   OPERATION: ${{ inputs.operation }}
   CONFIRMATION: ${{ inputs.confirmation }}
+  DRIFT_SCENARIO: ${{ inputs.drift_scenario }}
 
 jobs:
   validate:
@@ -55,6 +59,12 @@ jobs:
           fi
           case "$OPERATION" in
             deploy) ;;
+            drift)
+              case "$TARGET_REPOSITORY:$DRIFT_SCENARIO" in
+                *:tag|msp-networking:configuration|msp-ec2:configuration) ;;
+                *) echo 'Unsupported drift scenario for this repository.' >&2; exit 1 ;;
+              esac
+              ;;
             destroy)
               if [[ "$CONFIRMATION" != "destroy $TARGET_REPOSITORY" ]]; then
                 printf 'Type exactly: destroy %s\n' "$TARGET_REPOSITORY" >&2
@@ -116,6 +126,7 @@ jobs:
             fi
           fi
       - name: Plan and apply this repository's change
+        if: inputs.operation != 'drift'
         run: |
           git ls-remote --exit-code origin refs/heads/main | cut -f1 | grep -Fxq "$GITHUB_SHA"
           args=(-input=false -no-color -lock-timeout=5m -out=sandbox.tfplan -var="aws_region=$AWS_REGION")
@@ -125,3 +136,53 @@ jobs:
           terraform plan "${args[@]}"
           terraform apply -input=false -no-color -lock-timeout=5m sandbox.tfplan
           printf '### Terraform %s finished for %s\n' "$OPERATION" "$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
+      - name: Introduce one Terraform-managed change
+        if: inputs.operation == 'drift'
+        env:
+          TARGET_REPOSITORY: __TARGET_REPOSITORY__
+        run: |
+          git ls-remote --exit-code origin refs/heads/main | cut -f1 | grep -Fxq "$GITHUB_SHA"
+          value="msp-drift-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          case "$TARGET_REPOSITORY:$DRIFT_SCENARIO" in
+            msp-networking:configuration)
+              id=$(terraform output -raw app_security_group_id)
+              [[ "$id" =~ ^sg-[0-9a-f]+$ ]]
+              rule_id=$(aws ec2 describe-security-group-rules --filters "Name=group-id,Values=$id" --output json --no-cli-pager | jq -er '
+                [.SecurityGroupRules[] | select(.IsEgress == false and .IpProtocol == "tcp" and .FromPort == 443 and .ToPort == 443 and .CidrIpv4 != null)]
+                | if length == 1 then .[0].SecurityGroupRuleId else error("Expected exactly one IPv4 HTTPS ingress rule") end')
+              [[ "$rule_id" =~ ^sgr-[0-9a-f]+$ ]]
+              aws ec2 update-security-group-rule-descriptions-ingress --group-id "$id" \
+                --security-group-rule-descriptions "SecurityGroupRuleId=$rule_id,Description=$value" --no-cli-pager
+              change="Changed the existing HTTPS ingress rule description to $value."
+              ;;
+            msp-ec2:configuration)
+              id=$(terraform output -raw ec2_instance_id)
+              [[ "$id" =~ ^i-[0-9a-f]+$ ]]
+              aws ec2 modify-instance-attribute --instance-id "$id" --disable-api-termination --no-cli-pager
+              change='Enabled EC2 termination protection. Restore the instance before destroying this stack.'
+              ;;
+            msp-networking:tag)
+              id=$(terraform output -raw app_security_group_id)
+              [[ "$id" =~ ^sg-[0-9a-f]+$ ]]
+              key=Tier
+              aws ec2 create-tags --resources "$id" --tags "Key=$key,Value=$value" --no-cli-pager
+              ;;
+            msp-ec2:tag)
+              id=$(terraform output -raw ec2_instance_id)
+              [[ "$id" =~ ^i-[0-9a-f]+$ ]]
+              key=Owner
+              aws ec2 create-tags --resources "$id" --tags "Key=$key,Value=$value" --no-cli-pager
+              ;;
+            msp-database:tag)
+              id=$(terraform show -json | jq -er \
+                '.values.root_module.resources[] | select(.address == "aws_db_instance.main") | .values.arn')
+              [[ "$id" == "arn:aws:rds:$AWS_REGION:$EXPECTED_AWS_ACCOUNT:db:"?* ]]
+              key=Service
+              aws rds add-tags-to-resource --resource-name "$id" --tags "Key=$key,Value=$value" --no-cli-pager
+              ;;
+            *) exit 1 ;;
+          esac
+          if [[ "$DRIFT_SCENARIO" == tag ]]; then
+            change="Set the Terraform-managed $key tag to $value."
+          fi
+          printf '### Test drift injected\n\n%s Run Drift Check to detect it.\n' "$change" >> "$GITHUB_STEP_SUMMARY"
