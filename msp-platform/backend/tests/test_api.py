@@ -374,3 +374,86 @@ def test_update_credentials_supports_static_key_and_temporary_session(tmp_path: 
         assert r2.json()["aws_credential_mode"] == "temporary_session"
 
 
+def test_multi_folder_scan_sync_and_restore_in_single_repo(tmp_path: Path):
+    roots = [
+        "msp-sandbox-infra/stacks/networking",
+        "msp-sandbox-infra/stacks/ec2",
+        "msp-sandbox-infra/stacks/database",
+    ]
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        github_repo="TumblerWarren/AWS-MSP",
+        github_token="example-token",
+        dry_run_github=False,
+        drift_report_bucket="msp-drift-reports-test",
+        terraform_roots=roots,
+    )
+    full = combined_demo_plan()
+    sg_plan = {**full, "resource_drift": [full["resource_drift"][0]], "resource_changes": [full["resource_changes"][0]]}
+    ec2_plan = {**full, "resource_drift": [full["resource_drift"][1]], "resource_changes": [full["resource_changes"][1]]}
+
+    runs = [
+        {"id": 102, "run_attempt": 1, "run_number": 12, "status": "completed", "conclusion": "success"},
+        {"id": 101, "run_attempt": 1, "run_number": 11, "status": "completed", "conclusion": "success"},
+    ]
+    reports = {
+        "drift-reports/tumblerwarren/aws-msp/102/1.json": {
+            "plan.redacted.json": ec2_plan,
+            "meta.json": {
+                "account_id": "135443845882",
+                "region": "ap-south-1",
+                "root_dir": "msp-sandbox-infra/stacks/ec2",
+                "commit_sha": "a" * 40,
+                "state_serial": 3,
+                "state_lineage": "ec2-lineage",
+            },
+        },
+        "drift-reports/tumblerwarren/aws-msp/101/1.json": {
+            "plan.redacted.json": sg_plan,
+            "meta.json": {
+                "account_id": "135443845882",
+                "region": "ap-south-1",
+                "root_dir": "msp-sandbox-infra/stacks/networking",
+                "commit_sha": "a" * 40,
+                "state_serial": 2,
+                "state_lineage": "net-lineage",
+            },
+        },
+    }
+    s3 = Mock()
+    s3.get_object.side_effect = lambda Bucket, Key: {"Body": BytesIO(json.dumps(reports[Key]).encode())}
+
+    dispatch = AsyncMock(return_value={"workflow_run_id": 500})
+    with (
+        TestClient(create_app(settings)) as client,
+        patch("app.services.github_client.GitHubClient.dispatch_workflow", autospec=True, side_effect=dispatch),
+        patch("app.services.github_client.GitHubClient.list_workflow_runs", return_value=runs),
+        patch("app.services.orchestrator.boto3.client", return_value=s3),
+    ):
+        # 1. Trigger scan dispatches drift-check.yml once per configured folder inside AWS-MSP
+        scan = client.post("/api/scans/trigger", json={})
+        assert scan.status_code == 200
+        dispatched_roots = [c.kwargs["inputs"]["root_dir"] for c in dispatch.await_args_list]
+        assert dispatched_roots == roots
+
+        # 2. Sync GitHub ingests latest report per folder into distinct workspace findings
+        synced = client.post("/api/scans/sync")
+        assert synced.status_code == 200
+        findings = synced.json()["findings"]
+        assert {f["root_dir"] for f in findings} == {
+            "msp-sandbox-infra/stacks/networking",
+            "msp-sandbox-infra/stacks/ec2",
+        }
+
+        # 3. Restoring EC2 folder passes expected_root = msp-sandbox-infra/stacks/ec2 to restore.yml
+        dispatch.reset_mock()
+        ec2_f = next(f for f in findings if f["root_dir"] == "msp-sandbox-infra/stacks/ec2")
+        rem = client.post(
+            "/api/remediations/restore-workspace",
+            json={"selections": [{"finding_id": ec2_f["id"], "fingerprint": ec2_f["fingerprint"]}], "rationale": "revert ec2"},
+        )
+        assert rem.status_code == 200
+        assert dispatch.await_args.kwargs["inputs"]["expected_root"] == "msp-sandbox-infra/stacks/ec2"
+
+
+

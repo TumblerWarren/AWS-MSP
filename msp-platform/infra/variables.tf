@@ -53,6 +53,16 @@ variable "terraform_repositories" {
   description = "Additional registered Terraform GitHub repositories mapped to their deployment branches."
 }
 
+variable "terraform_roots" {
+  type = list(string)
+  default = [
+    "msp-sandbox-infra/stacks/networking",
+    "msp-sandbox-infra/stacks/ec2",
+    "msp-sandbox-infra/stacks/database",
+  ]
+  description = "Terraform stack folders inside github_repo scanned by Drift Check and Sync GitHub."
+}
+
 variable "github_token" {
   type        = string
   default     = ""

@@ -3,8 +3,8 @@ name: PR Terraform Plan & Policy Gate
 on:
   pull_request:
     paths:
+      - "msp-sandbox-infra/stacks/**"
       - "msp-sandbox-infra/infra/**"
-      - "infra/**"
 
 permissions:
   id-token: write
@@ -12,13 +12,44 @@ permissions:
   pull-requests: write
 
 env:
-  TF_WORKING_DIR: msp-sandbox-infra/infra
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
 
 jobs:
-  plan-and-gate:
+  detect:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    outputs:
+      roots: ${{ steps.changed.outputs.roots }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changed
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, subprocess
+          base = os.environ["GITHUB_BASE_REF"]
+          diff = subprocess.check_output(["git", "diff", "--name-only", f"origin/{base}...HEAD"], text=True).splitlines()
+          candidates = [
+              "msp-sandbox-infra/stacks/networking",
+              "msp-sandbox-infra/stacks/ec2",
+              "msp-sandbox-infra/stacks/database",
+              "msp-sandbox-infra/infra",
+          ]
+          hit = [root for root in candidates if any(path.startswith(root + "/") for path in diff)]
+          print("roots=" + json.dumps(hit))
+          PY
+
+  plan-and-gate:
+    needs: detect
+    if: needs.detect.outputs.roots != '[]' && needs.detect.outputs.roots != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        root_dir: ${{ fromJson(needs.detect.outputs.roots) }}
+    env:
+      TF_WORKING_DIR: ${{ matrix.root_dir }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,6 +110,7 @@ jobs:
           python3 -m msp_policy redact \
             --in "${{ env.TF_WORKING_DIR }}/plan.raw.json" \
             --out out/plan.redacted.json
+          echo "## Stack: \`${{ env.TF_WORKING_DIR }}\`" > out/summary.md
           python3 -m msp_policy gate \
             --plan out/plan.redacted.json \
             --mode "${{ steps.mode.outputs.gate_mode }}" \

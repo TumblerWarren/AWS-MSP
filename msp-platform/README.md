@@ -30,18 +30,16 @@ The default `au.anthropic.claude-sonnet-4-6` profile uses Sydney as its Bedrock 
 
 The first release handles batch **Restore AWS**. **Update Terraform** opens a PR in the finding's repository and continues to require a clean candidate plan. Each registered repository uses one preconfigured Terraform root and state per deployment branch. Workspaces sharing a repository need their own workflow routing before they can be restored independently.
 
-The three split sandbox roots use their own backend keys under `split-sandbox/` and a new `msp-split-sandbox` resource name prefix. Networking owns the VPC, subnets, and security groups. EC2 and database look up the networking resources by name. Run **Deploy Sandbox Infrastructure** for networking first, then EC2 and database. Run **Destroy Sandbox Infrastructure** in reverse dependency order, with the exact confirmation `destroy <repository-name>`. Moving the existing monolithic resources would require a separate state migration with reviewed plans.
+## Split sandbox folders inside `AWS-MSP`
 
-### Enable the split repositories
+The sandbox infrastructure is organized as three independent Terraform stack folders inside `msp-sandbox-infra/stacks/`, each with its own S3 state key under `split-sandbox/` and `msp-split-sandbox` resource prefix:
+- `msp-sandbox-infra/stacks/networking/` (`split-sandbox/networking/terraform.tfstate`) — VPC, subnets, IGW, route table, `app-sg`, `rds-sg`
+- `msp-sandbox-infra/stacks/ec2/` (`split-sandbox/ec2/terraform.tfstate`) — EC2 instance (with `disable_api_termination = false`), looking up networking by name
+- `msp-sandbox-infra/stacks/database/` (`split-sandbox/database/terraform.tfstate`) — RDS subnet group and PostgreSQL instance, looking up networking by name
 
-1. Grant each repository's AWS CI identity access to its own Terraform state, its drift report S3 path, and the restore-plan path. The sandbox bootstrap accepts `additional_github_repositories` if you use the shared sandbox role. Configure `AWS_CI_ROLE_ARN`, `AWS_ACCOUNT_ID`, `TF_STATE_BUCKET`, and `AWS_REGION` on the Terraform repositories. Configure the protected `sandbox` environments and verify human approval before setting `MSP_ENABLE_LIFECYCLE=true` for deploy and destroy or `MSP_ENABLE_RESTORE=true` for restore apply.
-2. Set the platform repository variable `MSP_TERRAFORM_REPOSITORIES` to `{"TumblerWarren/msp-networking":"main","TumblerWarren/msp-ec2":"main","TumblerWarren/msp-database":"main"}` and deploy the updated platform stack. Give `MSP_GITHUB_PAT` access to the repos it needs to scan and restore. For a local backend, use the same JSON in `MSP_TERRAFORM_REPOSITORIES`.
-3. Run and sync a fresh scan before requesting a restore. The plan/apply workflow uses a saved binary plan in private S3 for at most one day, verifies its checksum, and compares the live plan again after approval. The app reads only redacted S3 reports. The existing sandbox repository remains registered through `MSP_GITHUB_REPO`.
-
-To regenerate the starter repositories locally, run `python msp-platform/scripts/export_split_repos.py <empty-destination>` from the platform repository.
-
-### Test drift across repositories
-
-After deploying the split sandbox, run **Inject Sandbox Test Drift** in two or three repositories. It changes the application security group’s `Tier` tag in networking, the instance’s `Owner` tag in EC2, or the RDS instance’s `Service` tag in database. Then run **Run Drift Scan** and **Sync GitHub**. Check that each repo has its own workspace group and restore plan. After approving and verifying a restore, check that its tag is back to the Terraform value and the other workspace findings are still open.
-
-Select `configuration` in EC2 to enable termination protection or in networking to change the existing HTTPS ingress rule’s description. The networking test preserves protocol, ports, and CIDRs. Restore EC2 termination protection to its Terraform value before destroying the EC2 stack.
+All workflows live directly under `.github/workflows/` in `TumblerWarren/AWS-MSP`:
+1. **Deploy Sandbox Infrastructure** (`deploy-infra.yml`) — choose `networking` first, then `ec2` and/or `database`.
+2. **Inject Sandbox Test Drift** (`test-drift.yml`) — choose a stack (`networking`, `ec2`, `database`) and scenario (`tag` or `configuration`).
+3. **Drift Check** (`drift-check.yml`) — scans the selected stack folder (or click **Run Drift Scan** in the UI to dispatch all configured `MSP_TERRAFORM_ROOTS` folders, then **Sync GitHub** to ingest the latest report per folder).
+4. **Restore AWS from Terraform** (`restore.yml`) — dispatched per workspace/folder via `expected_root` with full plan gating, private S3 plan checksum verification, `sandbox` environment human approval, and post-apply verification.
+5. **Destroy Sandbox Infrastructure** (`destroy-infra.yml`) — destroy `ec2` and `database` before `networking` (includes an ENI safety check on `networking`).

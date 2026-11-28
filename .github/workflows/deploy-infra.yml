@@ -1,23 +1,48 @@
 name: Deploy Sandbox Infrastructure
+run-name: Deploy Sandbox (${{ inputs.stack || 'networking' }})
 
 on:
   workflow_dispatch:
+    inputs:
+      stack:
+        description: "Sandbox Terraform folder to deploy (deploy networking first, then ec2 and database)"
+        required: true
+        default: "networking"
+        type: choice
+        options:
+          - networking
+          - ec2
+          - database
+          - legacy
 
 permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: terraform-sandbox-${{ inputs.stack || 'networking' }}
+  cancel-in-progress: false
+
 env:
-  TF_WORKING_DIR: msp-sandbox-infra/infra
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  STACK: ${{ inputs.stack || 'networking' }}
 
 jobs:
   deploy:
-    name: Deploy All Sandbox Infrastructure
+    name: Deploy ${{ inputs.stack || 'networking' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve Terraform folder
+        id: target
+        run: |
+          case "$STACK" in
+            networking|ec2|database) echo "dir=msp-sandbox-infra/stacks/$STACK" >> "$GITHUB_OUTPUT" ;;
+            legacy) echo "dir=msp-sandbox-infra/infra" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unsupported stack: $STACK" >&2; exit 1 ;;
+          esac
 
       - name: Configure AWS credentials (Access Key / Session Token or OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -35,7 +60,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init & Validate
-        working-directory: ${{ env.TF_WORKING_DIR }}
+        working-directory: ${{ steps.target.outputs.dir }}
         run: |
           terraform init -input=false \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
@@ -43,12 +68,12 @@ jobs:
           terraform validate
 
       - name: Terraform Plan & Apply
-        working-directory: ${{ env.TF_WORKING_DIR }}
+        working-directory: ${{ steps.target.outputs.dir }}
         run: |
           terraform plan -input=false -no-color -var="aws_region=${{ env.AWS_REGION }}" -out=tfplan
           terraform apply -input=false -auto-approve -no-color tfplan
           {
-            echo "### Sandbox Infrastructure Deployed"
+            echo "### Sandbox Stack Deployed: \`${{ steps.target.outputs.dir }}\`"
             echo '```json'
             terraform output -json
             echo '```'

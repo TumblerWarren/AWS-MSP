@@ -57,10 +57,11 @@ def _infer_severity(resource_type: str, changes: list[dict[str, Any]], drift_kin
 
 def _resolve_tf_dir(base_root: Path, root_dir: str = "infra") -> tuple[Path, str]:
     """Locate the sandbox Terraform directory whether base_root is a monorepo (AWS-MSP) or standalone."""
-    for candidate in (root_dir, "msp-sandbox-infra/infra", "infra"):
-        p = base_root / candidate
-        if p.is_dir():
-            return p, candidate
+    for base in (base_root, base_root.parent):
+        for candidate in (root_dir, "msp-sandbox-infra/stacks/networking", "msp-sandbox-infra/infra", "infra"):
+            p = base / candidate
+            if p.is_dir():
+                return p, candidate
     return base_root / root_dir, root_dir
 
 
@@ -188,17 +189,22 @@ class Orchestrator:
             saved.append(finding)
         return saved
 
-    async def _dispatch_scan(self, repo: str, ref: str | None, correlation_id: str) -> None:
+    async def _dispatch_scan(
+        self, repo: str, ref: str | None, correlation_id: str, root_dir: str | None = None
+    ) -> None:
         if not self.settings.github_configured:
             raise HTTPException(
                 status_code=400,
                 detail="GitHub token/repo not configured. Set MSP_GITHUB_TOKEN (or MSP_GITHUB_PAT in GitHub Secrets).",
             )
         gh = self._gh(repo)
+        inputs: dict[str, str] = {"correlation_id": correlation_id}
+        if root_dir:
+            inputs["root_dir"] = root_dir
         try:
             await gh.dispatch_workflow(
                 "drift-check.yml",
-                inputs={"correlation_id": correlation_id},
+                inputs=inputs,
                 ref=ref,
             )
         except GitHubError as exc:
@@ -222,15 +228,23 @@ class Orchestrator:
             raise HTTPException(status_code=400, detail="GitHub token/repo not configured.")
         correlation_id = f"scan-{uuid4().hex[:8]}"
         repos = list(self.settings.registered_repositories)
-        results = []
+        primary = self.settings.github_repo.strip().lower()
+        targets: list[tuple[str, str | None]] = []
         for repo in repos:
+            if repo == primary and self.settings.terraform_roots:
+                targets.extend((repo, root) for root in self.settings.terraform_roots)
+            else:
+                targets.append((repo, None))
+        results = []
+        for repo, root in targets:
+            label = f"{repo} ({root})" if root else repo
             try:
-                await self._dispatch_scan(repo, ref, correlation_id)
-                results.append(f"{repo}: dispatched")
+                await self._dispatch_scan(repo, ref, correlation_id, root_dir=root)
+                results.append(f"{label}: dispatched")
             except HTTPException as exc:
-                if len(repos) == 1:
+                if len(targets) == 1:
                     raise
-                results.append(f"{repo}: {exc.detail}")
+                results.append(f"{label}: {exc.detail}")
         return {
             "mode": "github_actions",
             "correlation_id": correlation_id,
@@ -258,40 +272,84 @@ class Orchestrator:
             raise HTTPException(status_code=502, detail="The S3 drift report has an invalid format.")
         return report
 
+    async def _load_run_report(self, gh: GitHubClient, run: dict[str, Any], repo: str) -> dict[str, Any] | None:
+        files = None
+        if self.settings.drift_report_bucket:
+            files = await run_in_threadpool(self._read_s3_drift_report, run["id"], run.get("run_attempt") or 1, repo)
+        if files is None:
+            artifacts = await gh.list_run_artifacts(run["id"])
+            drift_art = next((a for a in artifacts if str(a.get("name", "")).startswith("drift-report-")), None)
+            if drift_art is None:
+                return None
+            files = await gh.download_artifact_files(drift_art["id"])
+        return files
+
     async def sync_latest_drift_run(self, repo: str | None = None) -> dict[str, Any]:
-        """Ingest the latest successful drift report, with support for older GitHub artifacts."""
+        """Ingest the latest successful drift report(s) per Terraform folder in the repository."""
         if not self.settings.github_configured:
             raise HTTPException(status_code=400, detail="GitHub token/repo not configured.")
         repo = (repo or self.settings.github_repo).strip().lower()
         gh = self._gh(repo)
-        runs = await gh.list_workflow_runs("drift-check.yml", per_page=10)
-        completed = next((r for r in runs if r.get("status") == "completed" and r.get("conclusion") == "success"), None)
-        if not completed:
+        expected_roots = (
+            set(self.settings.terraform_roots)
+            if repo == self.settings.github_repo.strip().lower() and len(self.settings.terraform_roots) > 1
+            else set()
+        )
+        runs = await gh.list_workflow_runs("drift-check.yml", per_page=30 if expected_roots else 10)
+        completed_runs = [r for r in runs if r.get("status") == "completed" and r.get("conclusion") == "success"]
+        if not completed_runs:
             in_prog = next((r for r in runs if r.get("status") != "completed"), None)
             if in_prog:
                 return {"synced": False, "run_id": in_prog["id"], "findings": [], "message": f"drift-check.yml run #{in_prog['run_number']} is still {in_prog['status']}..."}
             raise HTTPException(status_code=404, detail="No completed drift-check.yml runs found on GitHub.")
 
-        files = None
-        if self.settings.drift_report_bucket:
-            files = await run_in_threadpool(self._read_s3_drift_report, completed["id"], completed.get("run_attempt") or 1, repo)
-        if files is None:
-            artifacts = await gh.list_run_artifacts(completed["id"])
-            drift_art = next((a for a in artifacts if str(a.get("name", "")).startswith("drift-report-")), None)
-            if not drift_art:
+        if not expected_roots:
+            completed = completed_runs[0]
+            files = await self._load_run_report(gh, completed, repo)
+            if files is None:
                 raise HTTPException(status_code=404, detail=f"No drift report found for run #{completed['run_number']}.")
-            files = await gh.download_artifact_files(drift_art["id"])
-        plan = files.get("plan.redacted.json")
-        meta = files.get("meta.json") or {}
-        if not isinstance(plan, dict) or not plan or not isinstance(meta, dict):
-            raise HTTPException(status_code=502, detail="The drift report contains an invalid plan or metadata.")
-        findings = self.ingest_plan(plan, {**meta, "repo": repo})
+            plan = files.get("plan.redacted.json")
+            meta = files.get("meta.json") or {}
+            if not isinstance(plan, dict) or not plan or not isinstance(meta, dict):
+                raise HTTPException(status_code=502, detail="The drift report contains an invalid plan or metadata.")
+            findings = self.ingest_plan(plan, {**meta, "repo": repo})
+            return {
+                "synced": True,
+                "run_id": completed["id"],
+                "run_url": completed.get("html_url"),
+                "findings": findings,
+                "message": f"Synced run #{completed['run_number']}: ingested {len(findings)} drift finding(s) from AWS.",
+            }
+
+        seen_roots: set[str] = set()
+        all_findings: list[Finding] = []
+        summaries: list[str] = []
+        for completed in completed_runs:
+            files = await self._load_run_report(gh, completed, repo)
+            if files is None:
+                continue
+            plan = files.get("plan.redacted.json")
+            meta = files.get("meta.json") or {}
+            if not isinstance(plan, dict) or not plan or not isinstance(meta, dict):
+                continue
+            root = str(meta.get("root_dir") or "infra")
+            if root in seen_roots:
+                continue
+            seen_roots.add(root)
+            ingested = self.ingest_plan(plan, {**meta, "repo": repo})
+            all_findings.extend(ingested)
+            summaries.append(f"{root.split('/')[-1]} (#{completed['run_number']}: {len(ingested)})")
+            if expected_roots <= seen_roots:
+                break
+
+        if not seen_roots:
+            raise HTTPException(status_code=404, detail="No drift reports found for recent drift-check.yml runs.")
         return {
             "synced": True,
-            "run_id": completed["id"],
-            "run_url": completed.get("html_url"),
-            "findings": findings,
-            "message": f"Synced run #{completed['run_number']}: ingested {len(findings)} drift finding(s) from AWS.",
+            "run_id": completed_runs[0]["id"],
+            "run_url": completed_runs[0].get("html_url"),
+            "findings": all_findings,
+            "message": f"Synced {len(seen_roots)} folder(s): {', '.join(summaries)}.",
         }
 
     # ------------------------------------------------------------------

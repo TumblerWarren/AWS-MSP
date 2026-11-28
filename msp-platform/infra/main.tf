@@ -246,6 +246,7 @@ resource "aws_ecs_task_definition" "platform" {
         { name = "MSP_DRIFT_REPORT_BUCKET", value = aws_s3_bucket.drift_reports.bucket },
         { name = "MSP_GITHUB_REPO", value = var.github_repo },
         { name = "MSP_TERRAFORM_REPOSITORIES", value = jsonencode(var.terraform_repositories) },
+        { name = "MSP_TERRAFORM_ROOTS", value = jsonencode(var.terraform_roots) },
         { name = "MSP_GITHUB_TOKEN", value = var.github_token }
       ]
       logConfiguration = {

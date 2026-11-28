@@ -1,10 +1,21 @@
 name: Destroy Sandbox Infrastructure
+run-name: Destroy Sandbox (${{ inputs.stack || 'ec2' }})
 
 on:
   workflow_dispatch:
     inputs:
+      stack:
+        description: "Sandbox Terraform folder to destroy (destroy ec2 and database before networking)"
+        required: true
+        default: "ec2"
+        type: choice
+        options:
+          - ec2
+          - database
+          - networking
+          - legacy
       confirm:
-        description: "Type 'destroy' to confirm removing all sandbox AWS resources"
+        description: "Type 'destroy' (or 'destroy <stack>') to confirm removing resources"
         required: true
         default: "destroy"
 
@@ -12,21 +23,31 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: terraform-sandbox-${{ inputs.stack || 'ec2' }}
+  cancel-in-progress: false
+
 env:
-  TF_WORKING_DIR: msp-sandbox-infra/infra
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  STACK: ${{ inputs.stack || 'ec2' }}
 
 jobs:
   destroy:
-    name: Destroy All Sandbox Infrastructure
+    name: Destroy ${{ inputs.stack || 'ec2' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Verify confirmation
+      - name: Verify confirmation & resolve folder
+        id: target
         run: |
-          if [ "${{ inputs.confirm }}" != "destroy" ]; then
-            echo "Confirmation input must be 'destroy'. Aborting."
+          if [[ "${{ inputs.confirm }}" != "destroy" && "${{ inputs.confirm }}" != "destroy $STACK" ]]; then
+            echo "Confirmation must be 'destroy' or 'destroy $STACK'. Aborting." >&2
             exit 1
           fi
+          case "$STACK" in
+            networking|ec2|database) echo "dir=msp-sandbox-infra/stacks/$STACK" >> "$GITHUB_OUTPUT" ;;
+            legacy) echo "dir=msp-sandbox-infra/infra" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unsupported stack: $STACK" >&2; exit 1 ;;
+          esac
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,11 +67,30 @@ jobs:
           terraform_version: "1.10.5"
           terraform_wrapper: false
 
-      - name: Terraform Init & Destroy
-        working-directory: ${{ env.TF_WORKING_DIR }}
+      - name: Terraform Init
+        working-directory: ${{ steps.target.outputs.dir }}
         run: |
           terraform init -input=false \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Check that networking has no dependent ENIs
+        if: inputs.stack == 'networking'
+        working-directory: ${{ steps.target.outputs.dir }}
+        run: |
+          vpc_id=$(terraform output -json | jq -er '.vpc_id.value // ""')
+          if [[ -n "$vpc_id" ]]; then
+            enis=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=$vpc_id" \
+              --query 'length(NetworkInterfaces)' --output json --no-cli-pager)
+            if [[ "$enis" != 0 ]]; then
+              echo "Networking VPC $vpc_id still has $enis attached ENI(s). Destroy ec2 and database stacks first." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Terraform Destroy
+        working-directory: ${{ steps.target.outputs.dir }}
+        run: |
           terraform destroy -input=false -auto-approve -no-color -var="aws_region=${{ env.AWS_REGION }}"
-          echo "### All Sandbox Infrastructure Removed" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Sandbox Stack Removed: \`${{ steps.target.outputs.dir }}\`" >> "$GITHUB_STEP_SUMMARY"

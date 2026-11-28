@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_default_branch: str = "master"
     terraform_repositories: dict[str, str] = Field(default_factory=dict)
+    terraform_roots: list[str] = Field(default_factory=list)
     local_infra_repo_path: str = "../../msp-sandbox-infra"
     dry_run_github: bool = False
     drift_report_bucket: str = ""

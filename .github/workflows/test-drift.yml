@@ -1,0 +1,134 @@
+name: Inject Sandbox Test Drift
+run-name: Inject Test Drift (${{ inputs.stack }} · ${{ inputs.scenario }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: "Sandbox folder whose deployed AWS resource will be drifted"
+        required: true
+        default: "networking"
+        type: choice
+        options:
+          - networking
+          - ec2
+          - database
+          - legacy
+      scenario:
+        description: "Choose tag drift or a resource configuration change (database supports tag only)"
+        required: true
+        default: "tag"
+        type: choice
+        options:
+          - tag
+          - configuration
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: terraform-sandbox-${{ inputs.stack }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  STACK: ${{ inputs.stack }}
+  DRIFT_SCENARIO: ${{ inputs.scenario }}
+
+jobs:
+  inject-drift:
+    name: Inject ${{ inputs.scenario }} drift (${{ inputs.stack }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate stack & scenario
+        id: target
+        run: |
+          case "$STACK:$DRIFT_SCENARIO" in
+            networking:tag|networking:configuration) echo "dir=msp-sandbox-infra/stacks/networking" >> "$GITHUB_OUTPUT" ;;
+            ec2:tag|ec2:configuration)               echo "dir=msp-sandbox-infra/stacks/ec2" >> "$GITHUB_OUTPUT" ;;
+            database:tag)                            echo "dir=msp-sandbox-infra/stacks/database" >> "$GITHUB_OUTPUT" ;;
+            legacy:tag|legacy:configuration)         echo "dir=msp-sandbox-infra/infra" >> "$GITHUB_OUTPUT" ;;
+            database:configuration)
+              echo "The database stack supports only 'tag' drift in this test workflow." >&2
+              exit 1
+              ;;
+            *) echo "Unsupported stack/scenario: $STACK:$DRIFT_SCENARIO" >&2; exit 1 ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Access Key / Session Token or OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ steps.target.outputs.dir }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Introduce one out-of-band AWS change
+        working-directory: ${{ steps.target.outputs.dir }}
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text --no-cli-pager)
+          value="msp-drift-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "$STACK:$DRIFT_SCENARIO" in
+            networking:configuration|legacy:configuration)
+              id=$(terraform output -raw app_security_group_id)
+              [[ "$id" =~ ^sg-[0-9a-f]+$ ]]
+              rule_id=$(aws ec2 describe-security-group-rules --filters "Name=group-id,Values=$id" --output json --no-cli-pager | jq -er '
+                [.SecurityGroupRules[] | select(.IsEgress == false and .IpProtocol == "tcp" and .FromPort == 443 and .ToPort == 443 and .CidrIpv4 != null)]
+                | if length == 1 then .[0].SecurityGroupRuleId else error("Expected exactly one IPv4 HTTPS ingress rule") end')
+              [[ "$rule_id" =~ ^sgr-[0-9a-f]+$ ]]
+              aws ec2 update-security-group-rule-descriptions-ingress --group-id "$id" \
+                --security-group-rule-descriptions "SecurityGroupRuleId=$rule_id,Description=$value" --no-cli-pager
+              change="Changed the HTTPS ingress rule description on \`$id\` to \`$value\` (preserving port 443 and CIDR)."
+              ;;
+            ec2:configuration)
+              id=$(terraform output -raw ec2_instance_id)
+              [[ "$id" =~ ^i-[0-9a-f]+$ ]]
+              aws ec2 modify-instance-attribute --instance-id "$id" --disable-api-termination --no-cli-pager
+              change="Enabled EC2 termination protection on \`$id\`. Restore before destroying this stack."
+              ;;
+            networking:tag|legacy:tag)
+              id=$(terraform output -raw app_security_group_id)
+              [[ "$id" =~ ^sg-[0-9a-f]+$ ]]
+              aws ec2 create-tags --resources "$id" --tags "Key=Tier,Value=$value" --no-cli-pager
+              change="Set \`Tier=$value\` on security group \`$id\`."
+              ;;
+            ec2:tag)
+              id=$(terraform output -raw ec2_instance_id)
+              [[ "$id" =~ ^i-[0-9a-f]+$ ]]
+              aws ec2 create-tags --resources "$id" --tags "Key=Owner,Value=$value" --no-cli-pager
+              change="Set \`Owner=$value\` on EC2 instance \`$id\`."
+              ;;
+            database:tag)
+              arn=$(terraform show -json | jq -er \
+                '.values.root_module.resources[] | select(.address == "aws_db_instance.main") | .values.arn')
+              [[ "$arn" == "arn:aws:rds:$AWS_REGION:$account:db:"?* ]]
+              aws rds add-tags-to-resource --resource-name "$arn" --tags "Key=Service,Value=$value" --no-cli-pager
+              change="Set \`Service=$value\` on RDS instance \`$arn\`."
+              ;;
+            *) exit 1 ;;
+          esac
+          {
+            echo "### Test Drift Injected (\`${{ steps.target.outputs.dir }}\`)"
+            echo ""
+            echo "$change"
+            echo ""
+            echo "Run **Drift Check** (or click **Run Drift Scan** + **Sync GitHub** in the MSP UI) to detect and investigate it."
+          } >> "$GITHUB_STEP_SUMMARY"
