@@ -1,15 +1,16 @@
 name: Deploy Sandbox Infrastructure
-run-name: Deploy Sandbox (${{ inputs.stack || 'networking' }})
+run-name: Deploy Sandbox Graph (${{ inputs.scope || 'all' }})
 
 on:
   workflow_dispatch:
     inputs:
-      stack:
-        description: "Sandbox Terraform folder to deploy (deploy networking first, then ec2 and database)"
+      scope:
+        description: "Deploy full dependency graph (all) or a single stack folder"
         required: true
-        default: "networking"
+        default: "all"
         type: choice
         options:
+          - all
           - networking
           - ec2
           - database
@@ -20,60 +21,281 @@ permissions:
   contents: read
 
 concurrency:
-  group: terraform-sandbox-${{ inputs.stack || 'networking' }}
+  group: terraform-sandbox-deploy-${{ inputs.scope || 'all' }}
   cancel-in-progress: false
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-  STACK: ${{ inputs.stack || 'networking' }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  PYTHONPATH: ${{ github.workspace }}/msp-sandbox-infra/scripts
 
 jobs:
-  deploy:
-    name: Deploy ${{ inputs.stack || 'networking' }}
+  # -------------------------------------------------------------------------
+  # Stage 1: Networking (VPC, Subnets, IGW, Route Table, Security Groups)
+  # -------------------------------------------------------------------------
+  plan-networking:
+    name: "1a. Plan Networking"
+    if: ${{ inputs.scope == 'all' || inputs.scope == 'networking' || inputs.scope == '' }}
     runs-on: ubuntu-latest
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/networking
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Resolve Terraform folder
-        id: target
-        run: |
-          case "$STACK" in
-            networking|ec2|database) echo "dir=msp-sandbox-infra/stacks/$STACK" >> "$GITHUB_OUTPUT" ;;
-            legacy) echo "dir=msp-sandbox-infra/infra" >> "$GITHUB_OUTPUT" ;;
-            *) echo "Unsupported stack: $STACK" >&2; exit 1 ;;
-          esac
-
-      - name: Configure AWS credentials (Access Key / Session Token or OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.10.5"
           terraform_wrapper: false
-
-      - name: Terraform Init & Validate
-        working-directory: ${{ steps.target.outputs.dir }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Init, validate, plan & policy summary
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="region=${{ env.AWS_REGION }}"
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
           terraform validate
+          terraform plan -input=false -no-color -var="aws_region=$AWS_REGION" -out=plan.tfplan
+          terraform show -json plan.tfplan > plan.raw.json
+          python3 -m msp_policy redact --in plan.raw.json --out plan.redacted.json
+          echo "## Stage 1: \`$TF_WORKING_DIR\`" >> "$GITHUB_STEP_SUMMARY"
+          python3 -m msp_policy gate --plan plan.redacted.json --mode apply --markdown "$GITHUB_STEP_SUMMARY"
 
-      - name: Terraform Plan & Apply
-        working-directory: ${{ steps.target.outputs.dir }}
+  apply-networking:
+    name: "1b. Approve & Apply Networking"
+    needs: [plan-networking]
+    if: ${{ !cancelled() && needs.plan-networking.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: sandbox
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/networking
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - name: Apply Networking
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform plan -input=false -no-color -var="aws_region=${{ env.AWS_REGION }}" -out=tfplan
-          terraform apply -input=false -auto-approve -no-color tfplan
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform apply -input=false -auto-approve -no-color -var="aws_region=$AWS_REGION"
           {
-            echo "### Sandbox Stack Deployed: \`${{ steps.target.outputs.dir }}\`"
+            echo "### Applied \`$TF_WORKING_DIR\`"
+            echo '```json'
+            terraform output -json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Stage 2A: EC2 (depends on Networking)
+  # -------------------------------------------------------------------------
+  plan-ec2:
+    name: "2a. Plan EC2"
+    needs: [apply-networking]
+    if: ${{ !cancelled() && ((inputs.scope == 'all' && needs.apply-networking.result == 'success') || inputs.scope == 'ec2') }}
+    runs-on: ubuntu-latest
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/ec2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Init, validate, plan & policy summary
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform validate
+          terraform plan -input=false -no-color -var="aws_region=$AWS_REGION" -out=plan.tfplan
+          terraform show -json plan.tfplan > plan.raw.json
+          python3 -m msp_policy redact --in plan.raw.json --out plan.redacted.json
+          echo "## Stage 2A: \`$TF_WORKING_DIR\`" >> "$GITHUB_STEP_SUMMARY"
+          python3 -m msp_policy gate --plan plan.redacted.json --mode apply --markdown "$GITHUB_STEP_SUMMARY"
+
+  apply-ec2:
+    name: "2b. Approve & Apply EC2"
+    needs: [plan-ec2]
+    if: ${{ !cancelled() && needs.plan-ec2.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: sandbox
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/ec2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - name: Apply EC2
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform apply -input=false -auto-approve -no-color -var="aws_region=$AWS_REGION"
+          {
+            echo "### Applied \`$TF_WORKING_DIR\`"
+            echo '```json'
+            terraform output -json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Stage 2B: Database / RDS (depends on Networking, parallel with EC2)
+  # -------------------------------------------------------------------------
+  plan-database:
+    name: "2c. Plan Database"
+    needs: [apply-networking]
+    if: ${{ !cancelled() && ((inputs.scope == 'all' && needs.apply-networking.result == 'success') || inputs.scope == 'database') }}
+    runs-on: ubuntu-latest
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/database
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Init, validate, plan & policy summary
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform validate
+          terraform plan -input=false -no-color -var="aws_region=$AWS_REGION" -out=plan.tfplan
+          terraform show -json plan.tfplan > plan.raw.json
+          python3 -m msp_policy redact --in plan.raw.json --out plan.redacted.json
+          echo "## Stage 2B: \`$TF_WORKING_DIR\`" >> "$GITHUB_STEP_SUMMARY"
+          python3 -m msp_policy gate --plan plan.redacted.json --mode apply --markdown "$GITHUB_STEP_SUMMARY"
+
+  apply-database:
+    name: "2d. Approve & Apply Database"
+    needs: [plan-database]
+    if: ${{ !cancelled() && needs.plan-database.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: sandbox
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/database
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - name: Apply Database
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform apply -input=false -auto-approve -no-color -var="aws_region=$AWS_REGION"
+          {
+            echo "### Applied \`$TF_WORKING_DIR\`"
+            echo '```json'
+            terraform output -json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Optional: Legacy monolithic stack (msp-sandbox-infra/infra)
+  # -------------------------------------------------------------------------
+  plan-legacy:
+    name: "Plan Legacy Stack"
+    if: ${{ inputs.scope == 'legacy' }}
+    runs-on: ubuntu-latest
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - name: Init, validate & plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform validate
+          terraform plan -input=false -no-color -var="aws_region=$AWS_REGION"
+
+  apply-legacy:
+    name: "Approve & Apply Legacy Stack"
+    needs: [plan-legacy]
+    if: ${{ !cancelled() && needs.plan-legacy.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: sandbox
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - name: Apply Legacy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform apply -input=false -auto-approve -no-color -var="aws_region=$AWS_REGION"
+          {
+            echo "### Applied \`$TF_WORKING_DIR\`"
             echo '```json'
             terraform output -json
             echo '```'

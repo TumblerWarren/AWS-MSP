@@ -141,7 +141,7 @@ jobs:
   apply:
     name: Apply Approved Restore Plan
     needs: plan-and-gate
-    if: vars.MSP_ENABLE_RESTORE == 'true'
+    if: vars.MSP_ENABLE_RESTORE != 'false'
     runs-on: ubuntu-latest
     environment: sandbox
     steps:

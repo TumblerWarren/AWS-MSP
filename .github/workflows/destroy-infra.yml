@@ -1,21 +1,22 @@
 name: Destroy Sandbox Infrastructure
-run-name: Destroy Sandbox (${{ inputs.stack || 'ec2' }})
+run-name: Destroy Sandbox Graph (${{ inputs.scope || 'all' }})
 
 on:
   workflow_dispatch:
     inputs:
-      stack:
-        description: "Sandbox Terraform folder to destroy (destroy ec2 and database before networking)"
+      scope:
+        description: "Destroy full reverse dependency graph (all: EC2 & Database first, then Networking) or one stack"
         required: true
-        default: "ec2"
+        default: "all"
         type: choice
         options:
+          - all
           - ec2
           - database
           - networking
           - legacy
       confirm:
-        description: "Type 'destroy' (or 'destroy <stack>') to confirm removing resources"
+        description: "Type 'destroy' to confirm removing sandbox AWS resources"
         required: true
         default: "destroy"
 
@@ -24,73 +25,154 @@ permissions:
   contents: read
 
 concurrency:
-  group: terraform-sandbox-${{ inputs.stack || 'ec2' }}
+  group: terraform-sandbox-destroy-${{ inputs.scope || 'all' }}
   cancel-in-progress: false
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-  STACK: ${{ inputs.stack || 'ec2' }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
 
 jobs:
-  destroy:
-    name: Destroy ${{ inputs.stack || 'ec2' }}
+  confirm:
+    name: "0. Verify Confirmation"
     runs-on: ubuntu-latest
     steps:
-      - name: Verify confirmation & resolve folder
-        id: target
-        run: |
-          if [[ "${{ inputs.confirm }}" != "destroy" && "${{ inputs.confirm }}" != "destroy $STACK" ]]; then
-            echo "Confirmation must be 'destroy' or 'destroy $STACK'. Aborting." >&2
+      - run: |
+          if [[ "${{ inputs.confirm }}" != "destroy" && "${{ inputs.confirm }}" != "destroy ${{ inputs.scope }}" ]]; then
+            echo "Confirmation must be 'destroy'. Aborting." >&2
             exit 1
           fi
-          case "$STACK" in
-            networking|ec2|database) echo "dir=msp-sandbox-infra/stacks/$STACK" >> "$GITHUB_OUTPUT" ;;
-            legacy) echo "dir=msp-sandbox-infra/infra" >> "$GITHUB_OUTPUT" ;;
-            *) echo "Unsupported stack: $STACK" >&2; exit 1 ;;
-          esac
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials (Access Key / Session Token or OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+  # -------------------------------------------------------------------------
+  # Stage 1A: Destroy EC2 (parallel with Database)
+  # -------------------------------------------------------------------------
+  destroy-ec2:
+    name: "1a. Approve & Destroy EC2"
+    needs: [confirm]
+    if: ${{ !cancelled() && (inputs.scope == 'all' || inputs.scope == 'ec2') }}
+    runs-on: ubuntu-latest
+    environment: sandbox
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/ec2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.10.5"
           terraform_wrapper: false
-
-      - name: Terraform Init
-        working-directory: ${{ steps.target.outputs.dir }}
+      - name: Destroy EC2
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="region=${{ env.AWS_REGION }}"
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform destroy -input=false -auto-approve -no-color -var="aws_region=$AWS_REGION"
+          echo "### Destroyed \`$TF_WORKING_DIR\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check that networking has no dependent ENIs
-        if: inputs.stack == 'networking'
-        working-directory: ${{ steps.target.outputs.dir }}
+  # -------------------------------------------------------------------------
+  # Stage 1B: Destroy Database (parallel with EC2)
+  # -------------------------------------------------------------------------
+  destroy-database:
+    name: "1b. Approve & Destroy Database"
+    needs: [confirm]
+    if: ${{ !cancelled() && (inputs.scope == 'all' || inputs.scope == 'database') }}
+    runs-on: ubuntu-latest
+    environment: sandbox
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/database
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - name: Destroy Database
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform destroy -input=false -auto-approve -no-color -var="aws_region=$AWS_REGION"
+          echo "### Destroyed \`$TF_WORKING_DIR\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Stage 2: Destroy Networking (runs ONLY after EC2 & Database are gone)
+  # -------------------------------------------------------------------------
+  destroy-networking:
+    name: "2. Approve & Destroy Networking"
+    needs: [confirm, destroy-ec2, destroy-database]
+    if: ${{ !cancelled() && needs.confirm.result == 'success' && ((inputs.scope == 'all' && needs.destroy-ec2.result == 'success' && needs.destroy-database.result == 'success') || inputs.scope == 'networking') }}
+    runs-on: ubuntu-latest
+    environment: sandbox
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/stacks/networking
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - name: Check ENIs & Destroy Networking
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
           vpc_id=$(terraform output -json | jq -er '.vpc_id.value // ""')
           if [[ -n "$vpc_id" ]]; then
             enis=$(aws ec2 describe-network-interfaces \
               --filters "Name=vpc-id,Values=$vpc_id" \
               --query 'length(NetworkInterfaces)' --output json --no-cli-pager)
             if [[ "$enis" != 0 ]]; then
-              echo "Networking VPC $vpc_id still has $enis attached ENI(s). Destroy ec2 and database stacks first." >&2
+              echo "Networking VPC $vpc_id still has $enis attached ENI(s). Destroy ec2 and database first." >&2
               exit 1
             fi
           fi
+          terraform destroy -input=false -auto-approve -no-color -var="aws_region=$AWS_REGION"
+          echo "### Destroyed \`$TF_WORKING_DIR\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Terraform Destroy
-        working-directory: ${{ steps.target.outputs.dir }}
+  # -------------------------------------------------------------------------
+  # Optional: Destroy Legacy monolithic stack
+  # -------------------------------------------------------------------------
+  destroy-legacy:
+    name: "Approve & Destroy Legacy Stack"
+    needs: [confirm]
+    if: ${{ !cancelled() && inputs.scope == 'legacy' }}
+    runs-on: ubuntu-latest
+    environment: sandbox
+    env:
+      TF_WORKING_DIR: msp-sandbox-infra/infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - name: Destroy Legacy
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform destroy -input=false -auto-approve -no-color -var="aws_region=${{ env.AWS_REGION }}"
-          echo "### Sandbox Stack Removed: \`${{ steps.target.outputs.dir }}\`" >> "$GITHUB_STEP_SUMMARY"
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+          terraform destroy -input=false -auto-approve -no-color -var="aws_region=$AWS_REGION"
+          echo "### Destroyed \`$TF_WORKING_DIR\`" >> "$GITHUB_STEP_SUMMARY"
