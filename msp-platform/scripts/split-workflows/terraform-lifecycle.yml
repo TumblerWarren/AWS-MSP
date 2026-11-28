@@ -1,0 +1,127 @@
+name: Sandbox Terraform Lifecycle
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        type: string
+        required: true
+      confirmation:
+        type: string
+        default: ''
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_SESSION_TOKEN:
+        required: false
+      AWS_CI_ROLE_ARN:
+        required: false
+
+concurrency:
+  group: terraform-workspace-restore
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  EXPECTED_AWS_ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_WORKSPACE: default
+  OPERATION: ${{ inputs.operation }}
+  CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  validate:
+    name: Validate request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check scope and confirmation
+        env:
+          ENABLED: ${{ vars.MSP_ENABLE_LIFECYCLE }}
+          TARGET_REPOSITORY: __TARGET_REPOSITORY__
+        run: |
+          if [[ "$ENABLED" != true ]]; then
+            echo 'Configure the protected sandbox environment and set MSP_ENABLE_LIFECYCLE=true.' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != refs/heads/main || "${GITHUB_REPOSITORY#*/}" != "$TARGET_REPOSITORY" ]]; then
+            echo 'Run this workflow from main in its designated sandbox repository.' >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_AWS_ACCOUNT" =~ ^[0-9]{12}$ || -z "$TF_STATE_BUCKET" ]]; then
+            echo 'Configure AWS_ACCOUNT_ID and TF_STATE_BUCKET.' >&2
+            exit 1
+          fi
+          case "$OPERATION" in
+            deploy) ;;
+            destroy)
+              if [[ "$CONFIRMATION" != "destroy $TARGET_REPOSITORY" ]]; then
+                printf 'Type exactly: destroy %s\n' "$TARGET_REPOSITORY" >&2
+                exit 1
+              fi
+              ;;
+            *) exit 1 ;;
+          esac
+
+  terraform:
+    name: Run Terraform in the sandbox
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: sandbox
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.EXPECTED_AWS_ACCOUNT }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+          terraform_wrapper: false
+      - name: Initialize repository state and validate Terraform
+        env:
+          STATE_KEY: __STATE_KEY__
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text --no-cli-pager)
+          if [[ "$account" != "$EXPECTED_AWS_ACCOUNT" ]]; then
+            echo 'AWS credentials resolved to a different account.' >&2
+            exit 1
+          fi
+          aws s3api head-bucket --bucket "$TF_STATE_BUCKET" --expected-bucket-owner "$EXPECTED_AWS_ACCOUNT" --no-cli-pager
+          terraform init -input=false -lockfile=readonly \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="key=$STATE_KEY"
+          terraform validate -no-color
+      - name: Check that networking has no dependent interfaces
+        if: inputs.operation == 'destroy' && github.event.repository.name == 'msp-networking'
+        run: |
+          network_id=$(terraform output -json | jq -er '.vpc_id.value // ""')
+          if [[ -n "$network_id" ]]; then
+            interfaces=$(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$network_id" \
+              --query 'length(NetworkInterfaces)' --output json --no-cli-pager)
+            if [[ "$interfaces" != 0 ]]; then
+              echo 'Networking still has dependent interfaces. Destroy EC2 and database first.' >&2
+              exit 1
+            fi
+          fi
+      - name: Plan and apply this repository's change
+        run: |
+          git ls-remote --exit-code origin refs/heads/main | cut -f1 | grep -Fxq "$GITHUB_SHA"
+          args=(-input=false -no-color -lock-timeout=5m -out=sandbox.tfplan -var="aws_region=$AWS_REGION")
+          if [[ "$OPERATION" == destroy ]]; then
+            args+=(-destroy)
+          fi
+          terraform plan "${args[@]}"
+          terraform apply -input=false -no-color -lock-timeout=5m sandbox.tfplan
+          printf '### Terraform %s finished for %s\n' "$OPERATION" "$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"

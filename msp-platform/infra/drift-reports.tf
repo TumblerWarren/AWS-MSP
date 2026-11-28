@@ -24,6 +24,19 @@ resource "aws_s3_bucket_lifecycle_configuration" "drift_reports" {
   bucket = aws_s3_bucket.drift_reports.id
 
   rule {
+    id     = "expire-binary-restore-plans"
+    status = "Enabled"
+
+    filter {
+      prefix = "restore-plans/"
+    }
+
+    expiration {
+      days = 1
+    }
+  }
+
+  rule {
     id     = "expire-drift-reports"
     status = "Enabled"
 

@@ -1,0 +1,25 @@
+name: Destroy Sandbox Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type 'destroy' followed by this repository name (for example, 'destroy msp-ec2')
+        type: string
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  destroy:
+    uses: ./.github/workflows/terraform-lifecycle.yml
+    with:
+      operation: destroy
+      confirmation: ${{ inputs.confirm }}
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_CI_ROLE_ARN: ${{ secrets.AWS_CI_ROLE_ARN }}

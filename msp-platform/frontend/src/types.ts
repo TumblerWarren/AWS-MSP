@@ -114,6 +114,7 @@ export interface FindingSummary {
   root_dir: string;
   commit_sha: string | null;
   state_serial: number | null;
+  state_lineage: string | null;
   drift_hash: string;
   fingerprint: string;
   changes: AttrChange[];

@@ -47,6 +47,12 @@ variable "github_repo" {
   description = "Target IaC GitHub repo in 'owner/repo' format."
 }
 
+variable "terraform_repositories" {
+  type        = map(string)
+  default     = {}
+  description = "Additional registered Terraform GitHub repositories mapped to their deployment branches."
+}
+
 variable "github_token" {
   type        = string
   default     = ""

@@ -1,36 +1,193 @@
 name: Restore AWS from Terraform
+run-name: Restore ${{ inputs.correlation_id }}
 
 on:
   workflow_dispatch:
     inputs:
       finding_id:
-        description: "MSP Finding ID"
+        description: Primary MSP finding ID
+        type: string
         required: true
       correlation_id:
-        description: "Correlation ID from the MSP platform"
+        description: MSP restore request ID
+        type: string
         required: true
       allowed_addresses:
-        description: "JSON array of Terraform addresses allowed to change"
+        description: JSON array of resource instances reviewed for restore
+        type: string
         required: true
       expected_drift_hash:
-        description: "Drift evidence hash approved by the engineer"
+        description: Reviewed drift evidence hash
+        type: string
         required: true
       expected_commit:
-        description: "Terraform commit SHA approved by the engineer"
-        required: false
-        default: ""
+        description: Reviewed Terraform commit
+        type: string
+        required: true
+      expected_account:
+        description: Reviewed AWS account
+        type: string
+        required: true
+      expected_region:
+        description: Reviewed AWS region
+        type: string
+        required: true
+      expected_root:
+        description: Reviewed Terraform root
+        type: string
+        required: true
+      expected_lineage:
+        description: Reviewed Terraform state lineage
+        type: string
+        required: true
+      expected_serial:
+        description: Reviewed Terraform state serial
+        type: string
+        required: true
 
 permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: terraform-workspace-restore
+  cancel-in-progress: false
+
 env:
   TF_WORKING_DIR: msp-sandbox-infra/infra
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  PYTHONPATH: ${{ github.workspace }}/msp-sandbox-infra/scripts
+  ALLOWED_ADDRESSES: ${{ inputs.allowed_addresses }}
+  EXPECTED_DRIFT_HASH: ${{ inputs.expected_drift_hash }}
+  EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+  EXPECTED_ACCOUNT: ${{ inputs.expected_account }}
+  EXPECTED_REGION: ${{ inputs.expected_region }}
+  EXPECTED_ROOT: ${{ inputs.expected_root }}
+  EXPECTED_LINEAGE: ${{ inputs.expected_lineage }}
+  EXPECTED_SERIAL: ${{ inputs.expected_serial }}
 
 jobs:
   plan-and-gate:
     name: Plan & Deterministic Policy Gate
+    runs-on: ubuntu-latest
+    outputs:
+      key: ${{ steps.save.outputs.key }}
+      sha: ${{ steps.save.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Access Key / Session Token or OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+
+      - name: Validate workspace and generate full plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+          python3 -m msp_policy.workspace check
+          terraform plan -input=false -no-color -out=restore.tfplan
+          python3 -m msp_policy.workspace check
+          terraform show -json restore.tfplan > plan.raw.json
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+
+      - name: Gate and review the full plan
+        id: gate
+        run: |
+          mkdir -p out
+          python3 -m msp_policy redact --in "$TF_WORKING_DIR/plan.raw.json" --out out/plan.redacted.json
+          python3 -m msp_policy gate --plan out/plan.redacted.json --mode restore \
+            --allowed "$ALLOWED_ADDRESSES" --expected-drift-hash "$EXPECTED_DRIFT_HASH" \
+            --expected-commit "$EXPECTED_COMMIT" --actual-commit "$GITHUB_SHA" \
+            --out out/policy.json --markdown "$GITHUB_STEP_SUMMARY"
+          python3 -m msp_policy.workspace review out/plan.redacted.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Store the approved candidate plan in private S3
+        id: save
+        run: |
+          file="$TF_WORKING_DIR/restore.tfplan"
+          bucket="msp-drift-reports-$EXPECTED_ACCOUNT-$AWS_REGION"
+          key="restore-plans/${GITHUB_REPOSITORY,,}/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT.tfplan"
+          aws s3api put-object --bucket "$bucket" --expected-bucket-owner "$EXPECTED_ACCOUNT" \
+            --key "$key" --body "$file" --no-cli-pager >/dev/null
+          echo "sha=$(sha256sum "$file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+  apply:
+    name: Apply Approved Restore Plan
+    needs: plan-and-gate
+    if: vars.MSP_ENABLE_RESTORE == 'true'
+    runs-on: ubuntu-latest
+    environment: sandbox
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Access Key / Session Token or OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+
+      - name: Recheck current evidence and apply the reviewed plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          REVIEWED_KEY: ${{ needs.plan-and-gate.outputs.key }}
+          REVIEWED_SHA: ${{ needs.plan-and-gate.outputs.sha }}
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+          python3 -m msp_policy.workspace check
+          bucket="msp-drift-reports-$EXPECTED_ACCOUNT-$AWS_REGION"
+          aws s3api get-object --bucket "$bucket" --expected-bucket-owner "$EXPECTED_ACCOUNT" \
+            --key "$REVIEWED_KEY" --no-cli-pager restore.tfplan >/dev/null
+          echo "$REVIEWED_SHA  restore.tfplan" | sha256sum -c
+          terraform plan -input=false -no-color -out=fresh.tfplan
+          terraform show -json restore.tfplan > reviewed.json
+          terraform show -json fresh.tfplan > fresh.json
+          python3 -m msp_policy.workspace compare reviewed.json fresh.json
+          python3 -m msp_policy.workspace check
+          terraform apply -input=false -no-color restore.tfplan
+
+  verify:
+    name: Verify Restored Resources
+    needs: apply
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -56,86 +213,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Terraform Init & Plan
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: |
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="region=${{ env.AWS_REGION }}"
-          terraform plan -input=false -no-color -var="aws_region=${{ env.AWS_REGION }}" -out=restore.tfplan
-          terraform show -json restore.tfplan > plan.raw.json
 
-      - name: Redact plan & run deterministic policy gate
-        id: gate
+      - name: Verify the restored resources with a fresh full plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
         env:
-          PYTHONPATH: ${{ github.workspace }}/msp-sandbox-infra/scripts
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
         run: |
-          mkdir -p out
-          python3 -m msp_policy redact \
-            --in "${{ env.TF_WORKING_DIR }}/plan.raw.json" \
-            --out out/plan.redacted.json
-          python3 -m msp_policy gate \
-            --plan out/plan.redacted.json \
-            --mode restore \
-            --allowed '${{ inputs.allowed_addresses }}' \
-            --expected-drift-hash "${{ inputs.expected_drift_hash }}" \
-            --expected-commit "${{ inputs.expected_commit }}" \
-            --actual-commit "${{ github.sha }}" \
-            --out out/policy.json \
-            --markdown "$GITHUB_STEP_SUMMARY"
+          terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="region=$AWS_REGION"
 
-      - name: Upload policy result (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: restore-policy-${{ inputs.correlation_id }}
-          path: |
-            out/plan.redacted.json
-            out/policy.json
-          retention-days: 14
-
-      - name: Upload approved binary plan for apply job
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: restore-tfplan-${{ inputs.correlation_id }}
-          path: ${{ env.TF_WORKING_DIR }}/restore.tfplan
-          retention-days: 1
-
-  apply:
-    name: Apply Approved Restore Plan
-    needs: [plan-and-gate]
-    runs-on: ubuntu-latest
-    environment: sandbox
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials (Access Key / Session Token or OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          role-to-assume: ${{ secrets.AWS_ACCESS_KEY_ID == '' && secrets.AWS_CI_ROLE_ARN || '' }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.10.5"
-          terraform_wrapper: false
-
-      - name: Download approved plan
-        uses: actions/download-artifact@v4
-        with:
-          name: restore-tfplan-${{ inputs.correlation_id }}
-          path: ${{ env.TF_WORKING_DIR }}
-
-      - name: Terraform Init & Apply saved plan
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: |
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="region=${{ env.AWS_REGION }}"
-          terraform apply -input=false -auto-approve -no-color restore.tfplan
+          terraform plan -input=false -no-color -out=verification.tfplan
+          terraform show -json verification.tfplan > verification.json
+          python3 -m msp_policy.workspace verify verification.json >> "$GITHUB_STEP_SUMMARY"

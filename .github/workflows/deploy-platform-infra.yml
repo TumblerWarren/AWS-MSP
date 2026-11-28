@@ -16,6 +16,7 @@ permissions:
 env:
   TF_WORKING_DIR: msp-platform/infra
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  TF_VAR_terraform_repositories: ${{ vars.MSP_TERRAFORM_REPOSITORIES || '{}' }}
 
 jobs:
   deploy:

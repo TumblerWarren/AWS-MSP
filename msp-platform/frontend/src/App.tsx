@@ -27,6 +27,10 @@ const modelFields = [
   { key: "patcher", label: "Terraform patch model" },
 ] as const;
 
+function workspaceKey(finding: FindingSummary) {
+  return JSON.stringify([finding.repo, finding.root_dir, finding.account_id, finding.region, finding.state_lineage]);
+}
+
 export function App() {
   const [config, setConfig] = useState<PlatformConfig | null>(null);
   const [findings, setFindings] = useState<FindingSummary[]>([]);
@@ -38,6 +42,7 @@ export function App() {
   const [banner, setBanner] = useState<{ kind: "info" | "error"; text: string } | null>(null);
   const [showCreds, setShowCreds] = useState(false);
   const [modelForm, setModelForm] = useState<ModelPreferences | null>(null);
+  const [restoreReview, setRestoreReview] = useState<{ anchor: string; rationale: string; fingerprints: Record<string, string> } | null>(null);
   const [credForm, setCredForm] = useState({
     aws_access_key_id: "",
     aws_secret_access_key: "",
@@ -103,6 +108,28 @@ export function App() {
   const modelsChanged = config && modelForm && modelFields.some(
     ({ key }) => modelForm[key] !== config.model_preferences[key],
   );
+  const groupedFindings = new Map<string, FindingSummary[]>();
+  for (const finding of filtered) {
+    const key = workspaceKey(finding);
+    const group = groupedFindings.get(key);
+    if (group) group.push(finding);
+    else groupedFindings.set(key, [finding]);
+  }
+  const reviewing = restoreReview?.anchor === detail?.id ? restoreReview : null;
+  const workspaceFindings = detail && reviewing ? findings.filter((finding) => (
+    workspaceKey(finding) === workspaceKey(detail) && finding.status !== "resolved" &&
+    finding.commit_sha === detail.commit_sha && finding.state_serial === detail.state_serial
+  )) : [];
+  const checkedFindings = workspaceFindings.filter(({ id }) => reviewing?.fingerprints[id]);
+  const staleSelections = reviewing && Object.keys(reviewing.fingerprints).some((id) =>
+    !checkedFindings.some((finding) => finding.id === id && finding.fingerprint === reviewing.fingerprints[id]),
+  );
+  const plannedChanges = (detail?.redacted_plan.resource_changes ?? []) as { address: string; change?: { actions?: string[] } }[];
+  const unselectedChanges = plannedChanges.filter(({ address, change }) => (
+    change?.actions?.some((action) => action !== "no-op" && action !== "read") &&
+    !checkedFindings.some((finding) => finding.address === address)
+  ));
+  const latestRestore = detail?.latest_remediation;
 
   return (
     <div className="min-h-screen flex flex-col bg-[#09090b] text-zinc-100">
@@ -273,8 +300,8 @@ export function App() {
       )}
 
       {/* Workspace: Left Drift Inbox + Right Finding Detail */}
-      <div className="flex-1 flex min-h-0">
-        <aside className="w-80 lg:w-96 border-r border-zinc-800/80 bg-[#0b0b0e] flex flex-col shrink-0">
+      <div className="flex-1 flex flex-col md:flex-row min-h-0">
+        <aside className="w-full md:w-80 lg:w-96 max-h-[42vh] md:max-h-none border-b md:border-b-0 md:border-r border-zinc-800/80 bg-[#0b0b0e] flex flex-col shrink-0">
           <div className="p-3 border-b border-zinc-800/80 space-y-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-1.5 text-xs font-semibold text-zinc-200">
@@ -312,7 +339,7 @@ export function App() {
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto divide-y divide-zinc-800/60">
+          <div className="flex-1 min-h-0 overflow-y-auto divide-y divide-zinc-800/60">
             {filtered.length === 0 ? (
               <div className="p-6 text-center space-y-2">
                 <Terminal className="w-6 h-6 text-zinc-600 mx-auto" />
@@ -324,7 +351,13 @@ export function App() {
                 </p>
               </div>
             ) : (
-              filtered.map((f) => {
+              Array.from(groupedFindings.values()).map((group) => (
+                <section key={workspaceKey(group[0])} aria-label={`${group[0].repo} ${group[0].root_dir}`}>
+                  <h3 className="px-3.5 pt-3 text-xs font-medium text-zinc-300 break-words">{group[0].repo}</h3>
+                  <p className="px-3.5 pb-2 text-[11px] text-zinc-400 break-words">
+                    {group[0].root_dir} · {group[0].account_id} · {group[0].region}
+                  </p>
+                  {group.map((f) => {
                 const active = f.id === selectedId;
                 return (
                   <button
@@ -356,13 +389,72 @@ export function App() {
                     )}
                   </button>
                 );
-              })
+                  })}
+                </section>
+              ))
             )}
           </div>
         </aside>
 
         <main className="flex-1 overflow-y-auto">
           {detail ? (
+            <>
+            {reviewing && (
+              <section aria-labelledby="restore-review-title" className="mx-4 mt-4 rounded-xl border border-zinc-800 bg-[#111114] p-4 space-y-3">
+                <h2 id="restore-review-title" tabIndex={-1} className="text-sm font-semibold text-zinc-100">Review workspace restore</h2>
+                <p className="break-words text-xs text-zinc-400">{detail.repo} · {detail.root_dir} · {detail.account_id} · {detail.region}</p>
+                <fieldset className="divide-y divide-zinc-800">
+                  <legend className="mb-2 text-xs text-zinc-300">Choose resources to restore in this plan</legend>
+                  {workspaceFindings.map((finding) => (
+                    <label key={finding.id} className="flex items-start gap-2 py-2 text-xs text-zinc-200">
+                      <input type="checkbox" className="accent-emerald-500" checked={Boolean(reviewing.fingerprints[finding.id])}
+                        disabled={busyAction !== null}
+                        onChange={(event) => {
+                          const fingerprints = { ...reviewing.fingerprints };
+                          if (event.target.checked) fingerprints[finding.id] = finding.fingerprint;
+                          else delete fingerprints[finding.id];
+                          setRestoreReview({ ...reviewing, fingerprints });
+                        }} />
+                      <span className="min-w-0 break-all font-mono">{finding.address}</span>
+                    </label>
+                  ))}
+                </fieldset>
+                {unselectedChanges.length > 0 && (
+                  <div className="text-xs text-amber-300">
+                    <p>The workspace plan would also change these resources:</p>
+                    <ul className="mt-1 list-disc space-y-1 pl-4">
+                      {unselectedChanges.map(({ address }) => <li key={address} className="break-all font-mono">{address}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {!detail.state_lineage && <p className="text-xs text-amber-300">Sync a new scan to capture this workspace’s state identity.</p>}
+                {staleSelections && <p role="alert" className="text-xs text-amber-300">The evidence changed. Reopen this review to see the latest findings.</p>}
+                <div className="flex flex-wrap justify-end gap-2">
+                  <button type="button" onClick={() => setRestoreReview(null)} disabled={busyAction !== null} className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200">Cancel</button>
+                  <button type="button" disabled={busyAction !== null || !config?.github_configured || !detail.state_lineage || checkedFindings.length === 0 || unselectedChanges.length > 0 || !!staleSelections}
+                    className="rounded-md bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-zinc-950 disabled:opacity-50"
+                    onClick={() => void runAction("restore", async () => {
+                      await api.restoreWorkspace({ rationale: reviewing.rationale,
+                        selections: checkedFindings.map(({ id }) => ({ finding_id: id, fingerprint: reviewing.fingerprints[id] })) });
+                      setRestoreReview(null);
+                      await loadDetail(detail.id);
+                      await refreshList();
+                      setBanner({ kind: "info", text: "Workspace plan requested. Review the plan in GitHub Actions before authorizing apply." });
+                    })}>
+                    {busyAction === "restore" ? "Requesting plan…" : `Prepare plan (${checkedFindings.length})`}
+                  </button>
+                </div>
+              </section>
+            )}
+            {latestRestore?.direction === "restore" && latestRestore.correlation_id.startsWith("restore-") &&
+              ["running", "awaiting_approval"].includes(latestRestore.status) && (
+                <button type="button" disabled={busyAction !== null} className="mx-4 mt-4 rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200"
+                  onClick={() => void runAction("restore-status", async () => {
+                    await api.refreshRemediation(latestRestore.id);
+                    await loadDetail(detail.id);
+                    await refreshList();
+                  })}>Refresh restore status</button>
+            )}
             <FindingDetailView
               finding={detail}
               busyAction={busyAction}
@@ -374,17 +466,10 @@ export function App() {
                   await refreshList();
                 })
               }
-              onRestore={(rationale) =>
-                runAction("restore", async () => {
-                  const updated = await api.remediateRestore(detail.id, {
-                    decided_by: "engineer",
-                    rationale,
-                    expected_fingerprint: detail.fingerprint,
-                  });
-                  setDetail(updated);
-                  await refreshList();
-                })
-              }
+              onRestore={(rationale) => {
+                setRestoreReview({ anchor: detail.id, rationale, fingerprints: { [detail.id]: detail.fingerprint } });
+                requestAnimationFrame(() => document.getElementById("restore-review-title")?.focus());
+              }}
               onUpdateTerraform={(rationale) =>
                 runAction("update", async () => {
                   const updated = await api.remediateUpdateTerraform(detail.id, {
@@ -404,6 +489,7 @@ export function App() {
                 })
               }
             />
+            </>
           ) : (
             <div className="h-full flex items-center justify-center p-8 text-center">
               <div className="max-w-sm space-y-2">

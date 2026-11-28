@@ -35,7 +35,7 @@ class GitHubClient:
         workflow_file: str,
         inputs: dict[str, str],
         ref: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         url = f"{self.base_url}/actions/workflows/{workflow_file}/dispatches"
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
@@ -48,6 +48,9 @@ class GitHubClient:
                     f"dispatch {workflow_file} failed ({resp.status_code}): {resp.text}",
                     status_code=resp.status_code,
                 )
+            if resp.status_code == 200 and resp.content:
+                return resp.json()
+            return None
 
     async def list_workflow_runs(self, workflow_file: str, per_page: int = 10) -> list[dict[str, Any]]:
         url = f"{self.base_url}/actions/workflows/{workflow_file}/runs"
@@ -64,6 +67,13 @@ class GitHubClient:
             if resp.status_code != 200:
                 raise GitHubError(f"get run {run_id} failed ({resp.status_code}): {resp.text}")
             return resp.json()
+
+    async def list_run_jobs(self, run_id: int) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{self.base_url}/actions/runs/{run_id}/jobs", headers=self._headers())
+            if resp.status_code != 200:
+                raise GitHubError("GitHub did not return the restore job status.", status_code=resp.status_code)
+            return resp.json().get("jobs", [])
 
     async def list_run_artifacts(self, run_id: int) -> list[dict[str, Any]]:
         url = f"{self.base_url}/actions/runs/{run_id}/artifacts"

@@ -352,9 +352,9 @@ export function FindingDetailView({
                 {busyAction === "restore" ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
               </div>
               <div>
-                <div className="text-sm font-semibold text-zinc-100">Restore AWS</div>
+                <div className="text-sm font-semibold text-zinc-100">Review workspace restore</div>
                 <p className="text-xs text-zinc-400 mt-0.5">
-                  Terraform is right. Run <code className="text-zinc-300">restore.yml</code> through the policy gate and GitHub Environment approval. No Git change.
+                  Review and select the resources to restore together in one Terraform plan.
                 </p>
               </div>
             </button>

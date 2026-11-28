@@ -17,6 +17,7 @@ env:
 
 jobs:
   plan-and-gate:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -59,9 +60,10 @@ jobs:
 
       - name: Determine gate mode (update for drift-fix PRs, apply otherwise)
         id: mode
+        env:
+          PR_BRANCH: ${{ github.head_ref }}
         run: |
-          BRANCH="${{ github.head_ref }}"
-          if [[ "$BRANCH" == msp/drift-fix-* ]]; then
+          if [[ "$PR_BRANCH" == msp/drift-fix-* ]]; then
             echo "gate_mode=update" >> "$GITHUB_OUTPUT"
           else
             echo "gate_mode=apply" >> "$GITHUB_OUTPUT"
@@ -96,15 +98,6 @@ jobs:
               issue_number: context.issue.number,
               body,
             });
-
-      - name: Upload redacted PR plan & policy result
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-plan-${{ github.event.pull_request.number }}
-          path: |
-            out/plan.redacted.json
-            out/policy.json
-          retention-days: 14
 
       - name: Fail job if policy gate blocked
         if: steps.gate.outcome != 'success'

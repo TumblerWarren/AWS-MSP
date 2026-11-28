@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import BEDROCK_MODELS, Settings, get_settings
+from .services.github_client import GitHubError
 from .models import (
     AuditEvent,
     DecisionRequest,
@@ -20,6 +21,7 @@ from .models import (
     IngestPlanRequest,
     Investigation,
     Remediation,
+    RestoreBatchRequest,
     TriggerScanRequest,
     UpdateCredentialsRequest,
     UpdateModelsRequest,
@@ -110,6 +112,7 @@ def _serialize_finding(store: Store, f: Finding, *, full: bool = False) -> dict[
         "root_dir": f.root_dir,
         "commit_sha": f.commit_sha,
         "state_serial": f.state_serial,
+        "state_lineage": f.state_lineage,
         "drift_hash": f.drift_hash,
         "fingerprint": f.fingerprint,
         "changes": json.loads(f.changes_json or "[]"),
@@ -269,7 +272,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/scans/sync")
     async def sync_latest_scan(o: Orchestrator = Depends(get_orch), s: Store = Depends(get_store)) -> dict[str, Any]:
-        res = await o.sync_latest_drift_run()
+        repos = cfg.registered_repositories
+        if len(repos) <= 1:
+            res = await o.sync_latest_drift_run(next(iter(repos), None))
+        else:
+            results, messages = [], []
+            for repo in repos:
+                try:
+                    result = await o.sync_latest_drift_run(repo)
+                    results.append(result)
+                    messages.append(f"{repo}: {result['message']}")
+                except HTTPException as exc:
+                    messages.append(f"{repo}: {exc.detail}")
+                except GitHubError:
+                    messages.append(f"{repo}: GitHub could not provide the scan report.")
+            res = {
+                "synced": any(result["synced"] for result in results),
+                "run_id": None,
+                "message": " · ".join(messages),
+                "findings": [finding for result in results for finding in result["findings"]],
+            }
         return {
             "synced": res["synced"],
             "run_id": res["run_id"],
@@ -310,6 +332,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             expected_fingerprint=body.expected_fingerprint,
         )
         return _serialize_finding(s, f, full=True)
+
+    @app.post("/api/remediations/restore-workspace")
+    async def restore_workspace(body: RestoreBatchRequest, o: Orchestrator = Depends(get_orch)) -> dict[str, Any]:
+        findings, remediation = await o.restore_workspace(body.selections, body.rationale)
+        return {"finding_ids": [finding.id for finding in findings], "remediation": _serialize_remediation(remediation)}
+
+    @app.get("/api/remediations/{remediation_id}/refresh")
+    async def refresh_workspace_restore(remediation_id: str, o: Orchestrator = Depends(get_orch)) -> dict[str, Any] | None:
+        return _serialize_remediation(await o.refresh_workspace_restore(remediation_id))
 
     @app.post("/api/findings/{finding_id}/remediate/update-terraform")
     async def remediate_update_terraform(

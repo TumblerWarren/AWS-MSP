@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     github_repo: str = "TumblerWarren/AWS-MSP"  # owner/repo
     github_token: str = ""
     github_default_branch: str = "master"
+    terraform_repositories: dict[str, str] = Field(default_factory=dict)
     local_infra_repo_path: str = "../../msp-sandbox-infra"
     dry_run_github: bool = False
     drift_report_bucket: str = ""
@@ -84,6 +85,13 @@ class Settings(BaseSettings):
     @property
     def github_configured(self) -> bool:
         return bool(self.github_repo and self.github_token and not self.dry_run_github)
+
+    @property
+    def registered_repositories(self) -> dict[str, str]:
+        repos = {repo.lower(): branch for repo, branch in self.terraform_repositories.items()}
+        if self.github_repo:
+            repos.setdefault(self.github_repo.strip().lower(), self.github_default_branch)
+        return repos
 
     @property
     def resolved_local_infra_path(self) -> Path:

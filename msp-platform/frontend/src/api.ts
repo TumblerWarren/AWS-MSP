@@ -43,13 +43,13 @@ export const api = {
     method: "POST",
     body: JSON.stringify({}),
   }),
-  syncGitHub: () => req<{ synced: boolean; run_id: number; run_url?: string; message: string; findings: FindingSummary[] }>("/api/scans/sync", {
+  syncGitHub: () => req<{ synced: boolean; run_id: number | null; run_url?: string; message: string; findings: FindingSummary[] }>("/api/scans/sync", {
     method: "POST",
   }),
   investigate: (id: string) =>
     req<FindingDetail>(`/api/findings/${id}/investigate`, { method: "POST" }),
-  remediateRestore: (id: string, payload: { decided_by: string; rationale: string; expected_fingerprint: string }) =>
-    req<FindingDetail>(`/api/findings/${id}/remediate/restore`, {
+  restoreWorkspace: (payload: { rationale: string; selections: { finding_id: string; fingerprint: string }[] }) =>
+    req<{ remediation: Remediation }>("/api/remediations/restore-workspace", {
       method: "POST",
       body: JSON.stringify(payload),
     }),

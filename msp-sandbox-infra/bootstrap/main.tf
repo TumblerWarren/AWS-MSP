@@ -36,6 +36,12 @@ variable "platform_github_repo" {
   description = "Optional platform GitHub repository in 'owner/repo' format (e.g. 'your-org/msp-platform') also allowed to assume the OIDC CI role."
 }
 
+variable "additional_github_repositories" {
+  type        = set(string)
+  default     = []
+  description = "Additional Terraform repositories allowed to assume the sandbox CI role."
+}
+
 variable "state_bucket_name" {
   type        = string
   default     = ""
@@ -46,11 +52,11 @@ locals {
   bucket_name             = var.state_bucket_name != "" ? var.state_bucket_name : "msp-sandbox-tfstate-${data.aws_caller_identity.current.account_id}"
   drift_report_bucket_arn = "arn:aws:s3:::msp-drift-reports-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
   repo_parts              = split("/", var.github_repo)
-  allowed_subs = compact([
+  allowed_subs = compact(concat([
     "repo:${var.github_repo}:*",
     "repo:${local.repo_parts[0]}@*/${local.repo_parts[1]}@*:*",
     var.platform_github_repo != "" ? "repo:${var.platform_github_repo}:*" : ""
-  ])
+  ], [for repo in var.additional_github_repositories : "repo:${repo}:*"]))
 }
 
 # --- Terraform State Bucket (native S3 lockfile locking in TF >= 1.10) ---
@@ -189,6 +195,12 @@ data "aws_iam_policy_document" "ci_terraform_permissions" {
     sid       = "PublishDriftReports"
     actions   = ["s3:PutObject"]
     resources = ["${local.drift_report_bucket_arn}/drift-reports/*"]
+  }
+
+  statement {
+    sid       = "TransferRestorePlans"
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${local.drift_report_bucket_arn}/restore-plans/*"]
   }
 }
 

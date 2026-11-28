@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy import func
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from .models import AuditEvent, Finding, Investigation, ModelPreferences, Remediation
@@ -45,14 +46,26 @@ class Store:
         with Session(self.engine) as s:
             return s.get(Finding, finding_id)
 
-    def find_open_by_address(self, address: str, account_id: str) -> Finding | None:
+    def find_open_by_address(self, candidate: Finding) -> Finding | None:
         with Session(self.engine) as s:
             stmt = select(Finding).where(
-                Finding.address == address,
-                Finding.account_id == account_id,
+                Finding.address == candidate.address,
+                Finding.account_id == candidate.account_id,
+                Finding.region == candidate.region,
+                func.lower(Finding.repo) == candidate.repo,
+                Finding.root_dir == candidate.root_dir,
+                Finding.state_lineage == candidate.state_lineage,
                 Finding.status != "resolved",
             )
             return s.exec(stmt).first()
+
+    def save_restore_batch(self, findings: list[Finding], remediations: list[Remediation]) -> None:
+        with Session(self.engine, expire_on_commit=False) as session:
+            for finding in findings:
+                finding.updated_at = _utcnow()
+                session.add(finding)
+            session.add_all(remediations)
+            session.commit()
 
     def save_finding(self, finding: Finding) -> Finding:
         finding.updated_at = _utcnow()
@@ -96,6 +109,12 @@ class Store:
     def get_remediation(self, remediation_id: str) -> Remediation | None:
         with Session(self.engine) as s:
             return s.get(Remediation, remediation_id)
+
+    def list_restore_batch(self, correlation_id: str) -> list[Remediation]:
+        with Session(self.engine) as s:
+            return list(s.exec(select(Remediation).where(
+                Remediation.correlation_id == correlation_id, Remediation.direction == "restore"
+            )).all())
 
     def save_remediation(self, rem: Remediation) -> Remediation:
         rem.updated_at = _utcnow()

@@ -177,6 +177,16 @@ class DecisionRequest(BaseModel):
     extra_instructions: str = ""
 
 
+class RestoreSelection(BaseModel):
+    finding_id: str
+    fingerprint: str
+
+
+class RestoreBatchRequest(BaseModel):
+    selections: list[RestoreSelection] = PydanticField(min_length=1, max_length=100)
+    rationale: str = ""
+
+
 class VerifyRequest(BaseModel):
     # Optional redacted plan payload for offline/local verification testing
     plan: dict[str, Any] | None = None

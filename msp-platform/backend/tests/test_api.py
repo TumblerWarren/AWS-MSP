@@ -224,6 +224,52 @@ def test_model_preferences_persist_and_apply_to_investigations(tmp_path: Path):
         assert reset.json()["strands_model_id"] == config["strands_model_id"]
 
 
+def test_workspace_restores_group_five_findings_into_two_plans(tmp_path: Path):
+    primary = "example/networking"
+    secondary = "example/compute"
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}", github_repo=primary,
+                        github_token="example-token", dry_run_github=False, terraform_repositories={secondary: "main"})
+    baseline = {"root_dir": "infra", "commit_sha": "1" * 40, "state_serial": 4, "account_id": "111122223333"}
+    full = combined_demo_plan()
+    short = {**full, "resource_drift": full["resource_drift"][:2], "resource_changes": full["resource_changes"][:2]}
+    dispatch = AsyncMock(side_effect=[{"workflow_run_id": 17}, {"workflow_run_id": 18}])
+    with TestClient(create_app(settings)) as client, patch("app.services.github_client.GitHubClient.dispatch_workflow", autospec=True, side_effect=dispatch):
+        a = client.post("/api/scans/ingest", json={"plan": short, "meta": {**baseline, "repo": primary, "state_lineage": "network-state"}}).json()["findings"]
+        b = client.post("/api/scans/ingest", json={"plan": full, "meta": {**baseline, "repo": secondary, "state_lineage": "compute-state"}}).json()["findings"]
+        assert len(client.get("/api/findings").json()) == 5
+
+        def prepare(items):
+            return client.post("/api/remediations/restore-workspace", json={"selections": [
+                {"finding_id": f["id"], "fingerprint": f["fingerprint"]} for f in items
+            ]})
+
+        assert prepare(a + b).status_code == 409
+        blocked = prepare(a[:1])
+        assert blocked.status_code == 409
+        assert a[1]["address"] in blocked.json()["detail"]
+        dispatch.assert_not_awaited()
+
+        assert prepare(b).status_code == 200
+        prepared = prepare(a)
+        assert prepared.status_code == 200
+        assert prepare(a).status_code == 409
+        assert [(call.args[0].repo, call.args[0].default_branch) for call in dispatch.await_args_list] == [(secondary, "main"), (primary, "master")]
+        assert [len(json.loads(call.kwargs["inputs"]["allowed_addresses"])) for call in dispatch.await_args_list] == [3, 2]
+
+        remediation = prepared.json()["remediation"]
+        with (
+            patch("app.services.github_client.GitHubClient.get_workflow_run", return_value={"id": 18, "status": "completed", "conclusion": "success"}),
+            patch("app.services.github_client.GitHubClient.list_run_jobs", return_value=[
+                {"name": "Apply Approved Restore Plan", "conclusion": "success"},
+                {"name": "Verify Restored Resources", "conclusion": "success"},
+            ]),
+        ):
+            refreshed = client.get(f"/api/remediations/{remediation['id']}/refresh")
+        assert refreshed.json()["status"] == "succeeded"
+        assert [client.get(f"/api/findings/{f['id']}").json()["status"] for f in a] == ["resolved", "resolved"]
+        assert client.get(f"/api/findings/{b[0]['id']}").json()["status"] == "remediating"
+
+
 def test_update_terraform_flow_opens_patch(tmp_path: Path):
     with _make_client(tmp_path) as client:
         r = client.post(

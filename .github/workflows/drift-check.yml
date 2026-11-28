@@ -61,12 +61,12 @@ jobs:
           print("lineage={}".format(s.get("lineage", "")))
           ' >> "$GITHUB_OUTPUT"
 
-      - name: Terraform Refresh-Only Plan
+      - name: Full Terraform Plan
         id: plan
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           set +e
-          terraform plan -refresh-only -detailed-exitcode -input=false -no-color -var="aws_region=${{ env.AWS_REGION }}" -out=drift.tfplan
+          terraform plan -detailed-exitcode -input=false -no-color -var="aws_region=${{ env.AWS_REGION }}" -out=drift.tfplan
           CODE=$?
           echo "exitcode=$CODE" >> "$GITHUB_OUTPUT"
           if [ "$CODE" -eq 1 ]; then
@@ -78,6 +78,7 @@ jobs:
         id: report
         env:
           PYTHONPATH: ${{ github.workspace }}/msp-sandbox-infra/scripts
+          CORRELATION_ID: ${{ inputs.correlation_id || github.run_id }}
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
@@ -89,7 +90,7 @@ jobs:
             --plan out/plan.redacted.json \
             --out out/meta.json \
             --workflow drift-check \
-            --correlation-id "${{ inputs.correlation_id || github.run_id }}" \
+            --correlation-id "$CORRELATION_ID" \
             --commit "${{ github.sha }}" \
             --ref "${{ github.ref }}" \
             --run-id "${{ github.run_id }}" \

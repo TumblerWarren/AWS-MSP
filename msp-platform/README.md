@@ -23,3 +23,19 @@ Back up or remove any retained reports before destroying the platform stack. Ter
 ## Bedrock model routing
 
 The default `au.anthropic.claude-sonnet-4-6` profile uses Sydney as its Bedrock endpoint and can process requests in Sydney or Melbourne. AWS and CloudTrail tools continue using the platform AWS region. For a custom model, the app uses the platform AWS region unless you set `MSP_BEDROCK_REGION` locally or the platform Terraform `bedrock_region` variable for ECS.
+
+## Repository and workspace restores
+
+**Run Drift Scan** and **Sync GitHub** operate on the registered Terraform repositories. In the Drift Inbox, open a finding and choose **Review workspace restore** to select all the resources you want in one workspace plan. An unselected proposed change blocks the request. GitHub Actions generates the full plan, validates the reviewed account, root, revision, state lineage, state serial, and drift, then displays the proposed actions before deployment approval. **Refresh restore status** reads the apply and independent verification jobs before closing findings.
+
+The first release handles batch **Restore AWS**. **Update Terraform** opens a PR in the finding's repository and continues to require a clean candidate plan. Each registered repository uses one preconfigured Terraform root and state per deployment branch. Workspaces sharing a repository need their own workflow routing before they can be restored independently.
+
+The three split sandbox roots use their own backend keys under `split-sandbox/` and a new `msp-split-sandbox` resource name prefix. Networking owns the VPC, subnets, and security groups. EC2 and database look up the networking resources by name. Run **Deploy Sandbox Infrastructure** for networking first, then EC2 and database. Run **Destroy Sandbox Infrastructure** in reverse dependency order, with the exact confirmation `destroy <repository-name>`. Moving the existing monolithic resources would require a separate state migration with reviewed plans.
+
+### Enable the split repositories
+
+1. Grant each repository's AWS CI identity access to its own Terraform state, its drift report S3 path, and the restore-plan path. The sandbox bootstrap accepts `additional_github_repositories` if you use the shared sandbox role. Configure `AWS_CI_ROLE_ARN`, `AWS_ACCOUNT_ID`, `TF_STATE_BUCKET`, and `AWS_REGION` on the Terraform repositories. Configure the protected `sandbox` environments and verify human approval before setting `MSP_ENABLE_LIFECYCLE=true` for deploy and destroy or `MSP_ENABLE_RESTORE=true` for restore apply.
+2. Set the platform repository variable `MSP_TERRAFORM_REPOSITORIES` to `{"TumblerWarren/msp-networking":"main","TumblerWarren/msp-ec2":"main","TumblerWarren/msp-database":"main"}` and deploy the updated platform stack. Give `MSP_GITHUB_PAT` access to the repos it needs to scan and restore. For a local backend, use the same JSON in `MSP_TERRAFORM_REPOSITORIES`.
+3. Run and sync a fresh scan before requesting a restore. The plan/apply workflow uses a saved binary plan in private S3 for at most one day, verifies its checksum, and compares the live plan again after approval. The app reads only redacted S3 reports. The existing sandbox repository remains registered through `MSP_GITHUB_REPO`.
+
+To regenerate the starter repositories locally, run `python msp-platform/scripts/export_split_repos.py <empty-destination>` from the platform repository.
