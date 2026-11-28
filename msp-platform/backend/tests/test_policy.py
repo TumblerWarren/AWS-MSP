@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from msp_policy import (
     REDACTED,
     drift_entries,
@@ -18,6 +20,7 @@ from msp_policy import (
     to_markdown,
 )
 from msp_policy.redact import contains_unredacted_secret
+from msp_policy.workspace import _compare
 
 from app.demo_fixtures import (
     clean_plan,
@@ -185,3 +188,90 @@ def test_cli_redact_and_gate_exit_codes(tmp_path: Path):
         check=False,
     )
     assert r3.returncode == 2
+
+
+def test_workspace_compare_ignores_ephemeral_metadata_and_ordering(tmp_path: Path):
+    reviewed = combined_demo_plan()
+    reviewed["timestamp"] = "2026-11-28T09:00:00Z"
+    reviewed["planned_values"] = {"root_module": {"resources": [{"address": "data.aws_ami.al2023", "mode": "data"}]}}
+    reviewed["relevant_attributes"] = [
+        {"resource": "aws_instance.app", "attribute": ["tags"]},
+        {"resource": "aws_security_group.app", "attribute": ["ingress"]},
+    ]
+    reviewed["resource_changes"].append(
+        {
+            "address": "data.aws_ami.al2023",
+            "mode": "data",
+            "type": "aws_ami",
+            "name": "al2023",
+            "change": {
+                "actions": ["read"],
+                "before": None,
+                "after": {
+                    "last_launched_time": "2026-11-28T08:00:00Z",
+                    "block_device_mappings": [{"device_name": "/dev/xvda"}, {"device_name": "/dev/xvdb"}],
+                },
+            },
+        }
+    )
+
+    fresh = copy.deepcopy(reviewed)
+    fresh["timestamp"] = "2026-11-28T09:05:12Z"
+    fresh["prior_state"] = {"values": {"root_module": {"resources": [{"values": {"password": "OTHER_VALUE"}}]}}}
+    fresh["planned_values"] = {"root_module": {"resources": [{"address": "data.aws_vpc.network", "mode": "data"}]}}
+    fresh["relevant_attributes"].reverse()
+    fresh["resource_changes"][-1]["change"]["after"]["last_launched_time"] = "2026-11-28T09:05:00Z"
+    fresh["resource_changes"][-1]["change"]["after"]["block_device_mappings"].reverse()
+    # Reverse SG ingress list order in both drift and changes
+    fresh["resource_drift"][0]["change"]["after"]["ingress"].reverse()
+    fresh["resource_changes"][0]["change"]["before"]["ingress"].reverse()
+    # Mutate volatile RDS attribute
+    fresh["resource_drift"][2]["change"]["after"]["latest_restorable_time"] = "2026-11-28T09:05:00Z"
+    fresh["resource_changes"][2]["change"]["before"]["latest_restorable_time"] = "2026-11-28T09:05:00Z"
+
+    rev_file = tmp_path / "reviewed.json"
+    fresh_file = tmp_path / "fresh.json"
+    rev_file.write_text(json.dumps(reviewed), encoding="utf-8")
+    fresh_file.write_text(json.dumps(fresh), encoding="utf-8")
+
+    _compare(str(rev_file), str(fresh_file))
+
+
+def test_workspace_compare_blocks_real_plan_or_drift_changes(tmp_path: Path):
+    reviewed = ec2_tag_drift_plan()
+    rev_file = tmp_path / "reviewed.json"
+    fresh_file = tmp_path / "fresh.json"
+    rev_file.write_text(json.dumps(reviewed), encoding="utf-8")
+
+    # 1. Mutate a real managed attribute value
+    mutated_attr = copy.deepcopy(reviewed)
+    mutated_attr["resource_changes"][0]["change"]["before"]["tags"]["Owner"] = "someone-else"
+    fresh_file.write_text(json.dumps(mutated_attr), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc1:
+        _compare(str(rev_file), str(fresh_file))
+    assert "resource_changes" in str(exc1.value)
+    assert "aws_instance.app" in str(exc1.value)
+
+    # 2. Change action from update to delete/create (replace)
+    mutated_action = copy.deepcopy(reviewed)
+    mutated_action["resource_changes"][0]["change"]["actions"] = ["delete", "create"]
+    fresh_file.write_text(json.dumps(mutated_action), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc2:
+        _compare(str(rev_file), str(fresh_file))
+    assert "resource_changes" in str(exc2.value)
+
+    # 3. Add a second managed resource change
+    extra_change = copy.deepcopy(reviewed)
+    extra_change["resource_changes"].extend(sg_ssh_drift_plan()["resource_changes"])
+    fresh_file.write_text(json.dumps(extra_change), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc3:
+        _compare(str(rev_file), str(fresh_file))
+    assert "aws_security_group.app" in str(exc3.value)
+
+    # 4. Incomplete plan
+    incomplete = copy.deepcopy(reviewed)
+    incomplete["complete"] = False
+    fresh_file.write_text(json.dumps(incomplete), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc4:
+        _compare(str(rev_file), str(fresh_file))
+    assert "errored or incomplete" in str(exc4.value)

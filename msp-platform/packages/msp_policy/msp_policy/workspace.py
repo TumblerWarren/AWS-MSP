@@ -7,8 +7,10 @@ import os
 import subprocess
 import sys
 
+from typing import Any
+
 from .drift import drift_entries
-from .plan import attribute_changes, load_plan, resource_changes
+from .plan import attribute_changes, canonical, load_plan, resource_changes
 from .redact import redact_plan
 
 
@@ -35,12 +37,90 @@ def _check_workspace(verify: bool = False) -> None:
             )
 
 
+def _plan_signature(plan: dict[str, Any]) -> dict[str, Any]:
+    """Return a canonical, order-insensitive signature of managed plan changes and drift."""
+    if plan.get("errored") or plan.get("complete") is False:
+        raise SystemExit("Terraform plan is errored or incomplete.")
+
+    after_unknown_by_addr = {
+        entry["address"]: canonical((entry.get("change") or {}).get("after_unknown"))
+        for entry in plan.get("resource_changes") or []
+        if entry.get("mode", "managed") == "managed" and "address" in entry
+    }
+
+    changes = sorted(
+        (
+            {
+                "address": change.address,
+                "type": change.type,
+                "actions": list(change.actions),
+                "action_reason": change.action_reason,
+                "changes": sorted(
+                    (diff.hash_dict() for diff in attribute_changes(change.type, change.before, change.after)),
+                    key=lambda d: d["path"],
+                ),
+                "after_unknown": after_unknown_by_addr.get(change.address),
+            }
+            for change in resource_changes(plan)
+            if not change.is_noop
+        ),
+        key=lambda item: item["address"],
+    )
+
+    drift = sorted(
+        (
+            {
+                "address": entry.address,
+                "type": entry.type,
+                "kind": entry.kind,
+                "resource_id": entry.resource_id,
+                "changes": sorted((diff.hash_dict() for diff in entry.changes), key=lambda d: d["path"]),
+            }
+            for entry in drift_entries(plan)
+        ),
+        key=lambda item: item["address"],
+    )
+
+    raw_outputs = plan.get("output_changes") or {}
+    outputs = {
+        name: {
+            "actions": list((ch or {}).get("actions") or []),
+            "before": canonical((ch or {}).get("before")),
+            "after": canonical((ch or {}).get("after")),
+            "after_unknown": canonical((ch or {}).get("after_unknown")),
+        }
+        for name, ch in sorted(raw_outputs.items())
+    }
+
+    return {
+        "resource_changes": changes,
+        "resource_drift": drift,
+        "output_changes": outputs,
+    }
+
+
+def _diff_addresses(rev_items: list[dict[str, Any]], fresh_items: list[dict[str, Any]]) -> list[str]:
+    rev_map = {item["address"]: item for item in rev_items}
+    fresh_map = {item["address"]: item for item in fresh_items}
+    return sorted(addr for addr in set(rev_map) | set(fresh_map) if rev_map.get(addr) != fresh_map.get(addr))
+
+
 def _compare(reviewed_path: str, fresh_path: str) -> None:
     reviewed, fresh = load_plan(reviewed_path), load_plan(fresh_path)
-    for plan in (reviewed, fresh):
-        plan.pop("timestamp", None)
-    if reviewed != fresh:
-        raise SystemExit("Terraform plan changed after review. Prepare a new restore plan.")
+    rev_sig = _plan_signature(reviewed)
+    fresh_sig = _plan_signature(fresh)
+    if rev_sig != fresh_sig:
+        parts: list[str] = []
+        for section in ("resource_changes", "resource_drift"):
+            if rev_sig[section] != fresh_sig[section]:
+                addrs = _diff_addresses(rev_sig[section], fresh_sig[section])
+                parts.append(f"{section}: {', '.join(addrs)}" if addrs else section)
+        if rev_sig["output_changes"] != fresh_sig["output_changes"]:
+            rev_out, fresh_out = rev_sig["output_changes"], fresh_sig["output_changes"]
+            names = sorted(k for k in set(rev_out) | set(fresh_out) if rev_out.get(k) != fresh_out.get(k))
+            parts.append(f"output_changes: {', '.join(names)}" if names else "output_changes")
+        detail = "; ".join(parts)
+        raise SystemExit(f"Terraform plan changed after review ({detail}). Prepare a new restore plan.")
 
 
 def _review(path: str) -> None:
