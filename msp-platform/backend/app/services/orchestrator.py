@@ -23,10 +23,18 @@ from fastapi import HTTPException
 from msp_policy import drift_entries, drift_hash, evaluate, fingerprint, redact_plan
 from starlette.concurrency import run_in_threadpool
 
-from ..agents.investigator import investigate_finding
-from ..agents.patcher import patch_terraform_workspace
+from ..agents.investigator import (
+    SYSTEM_PROMPT as INVESTIGATOR_SYSTEM_PROMPT,
+    build_investigation_prompt,
+    investigate_finding,
+)
+from ..agents.patcher import (
+    SYSTEM_PROMPT as PATCHER_SYSTEM_PROMPT,
+    build_patch_prompt,
+    patch_terraform_workspace,
+)
 from ..config import Settings
-from ..models import Finding, Investigation, Remediation, RestoreSelection
+from ..models import Finding, Investigation, ModelTrace, Remediation, RestoreSelection
 from ..services.github_client import GitHubClient, GitHubError
 from ..store import Store
 
@@ -85,6 +93,8 @@ class Orchestrator:
         self.store = store
         self.settings = settings
         self._restore_lock = asyncio.Lock()
+        self._scans: dict[str, dict[str, Any]] = {}
+        self._latest_scan_id: str | None = None
 
     def _gh(self, repo: str | None = None) -> GitHubClient:
         repo = repo or self.settings.github_repo
@@ -191,7 +201,7 @@ class Orchestrator:
 
     async def _dispatch_scan(
         self, repo: str, ref: str | None, correlation_id: str, root_dir: str | None = None
-    ) -> None:
+    ) -> dict[str, Any] | None:
         if not self.settings.github_configured:
             raise HTTPException(
                 status_code=400,
@@ -202,7 +212,7 @@ class Orchestrator:
         if root_dir:
             inputs["root_dir"] = root_dir
         try:
-            await gh.dispatch_workflow(
+            return await gh.dispatch_workflow(
                 "drift-check.yml",
                 inputs=inputs,
                 ref=ref,
@@ -223,33 +233,264 @@ class Orchestrator:
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail="Could not reach GitHub to dispatch the drift scan.") from exc
 
+    @staticmethod
+    def _recompute_scan_progress(scan: dict[str, Any]) -> dict[str, Any]:
+        weights = {"queued": 15, "in_progress": 55, "syncing": 85, "synced": 100, "failed": 100}
+        targets = scan["targets"]
+        total = max(len(targets), 1)
+        pct = round(sum(weights.get(t["status"], 10) for t in targets) / total)
+        done = [t for t in targets if t["status"] in ("synced", "failed")]
+        failed = [t for t in targets if t["status"] == "failed"]
+        synced = [t for t in targets if t["status"] == "synced"]
+        findings_total = sum(t.get("findings_count", 0) for t in targets)
+        scan["progress_pct"] = pct
+        scan["completed_count"] = len(done)
+        scan["total_count"] = len(targets)
+        scan["findings_ingested"] = findings_total
+        scan["updated_at"] = _utcnow().isoformat()
+        if len(done) == len(targets):
+            if len(failed) == len(targets):
+                scan["status"] = "failed"
+                scan["message"] = f"Drift scan failed across {len(failed)} stack(s)."
+            elif failed:
+                scan["status"] = "partial_failure"
+                scan["message"] = (
+                    f"Scan finished: {len(synced)}/{len(targets)} stack(s) synced "
+                    f"({findings_total} finding(s)); {len(failed)} failed."
+                )
+            else:
+                scan["status"] = "completed"
+                scan["message"] = (
+                    f"Scan complete: {len(synced)}/{len(targets)} stack(s) synced "
+                    f"({findings_total} drift finding(s) detected)."
+                )
+        else:
+            in_prog = sum(1 for t in targets if t["status"] == "in_progress")
+            scan["status"] = "running"
+            scan["message"] = (
+                f"Scanning {len(targets)} stack(s) · {len(done)}/{len(targets)} complete"
+                + (f" ({in_prog} running)" if in_prog else " (queued on GitHub Actions)")
+            )
+        return scan
+
     async def trigger_scan(self, ref: str | None = None) -> dict[str, Any]:
         if not self.settings.github_configured:
             raise HTTPException(status_code=400, detail="GitHub token/repo not configured.")
         correlation_id = f"scan-{uuid4().hex[:8]}"
+        started_at = _utcnow().isoformat()
         repos = list(self.settings.registered_repositories)
         primary = self.settings.github_repo.strip().lower()
-        targets: list[tuple[str, str | None]] = []
+        targets_spec: list[tuple[str, str | None]] = []
         for repo in repos:
             if repo == primary and self.settings.terraform_roots:
-                targets.extend((repo, root) for root in self.settings.terraform_roots)
+                targets_spec.extend((repo, root) for root in self.settings.terraform_roots)
             else:
-                targets.append((repo, None))
+                targets_spec.append((repo, None))
         results = []
-        for repo, root in targets:
-            label = f"{repo} ({root})" if root else repo
+        scan_targets: list[dict[str, Any]] = []
+        for repo, root in targets_spec:
+            label = root.split("/")[-1] if root else repo.split("/")[-1]
+            full_label = f"{repo} ({root})" if root else repo
             try:
-                await self._dispatch_scan(repo, ref, correlation_id, root_dir=root)
-                results.append(f"{label}: dispatched")
+                dispatched = await self._dispatch_scan(repo, ref, correlation_id, root_dir=root)
+                results.append(f"{full_label}: dispatched")
+                scan_targets.append({
+                    "repo": repo,
+                    "root_dir": root,
+                    "label": label,
+                    "status": "queued",
+                    "conclusion": None,
+                    "run_id": (dispatched or {}).get("workflow_run_id"),
+                    "run_number": None,
+                    "run_url": (dispatched or {}).get("html_url"),
+                    "findings_count": 0,
+                    "error": None,
+                })
             except HTTPException as exc:
-                if len(targets) == 1:
+                if len(targets_spec) == 1:
                     raise
-                results.append(f"{label}: {exc.detail}")
+                results.append(f"{full_label}: {exc.detail}")
+                scan_targets.append({
+                    "repo": repo,
+                    "root_dir": root,
+                    "label": label,
+                    "status": "failed",
+                    "conclusion": "failure",
+                    "run_id": None,
+                    "run_number": None,
+                    "run_url": None,
+                    "findings_count": 0,
+                    "error": exc.detail,
+                })
+        scan = self._recompute_scan_progress({
+            "correlation_id": correlation_id,
+            "started_at": started_at,
+            "updated_at": started_at,
+            "status": "running",
+            "progress_pct": 15,
+            "completed_count": 0,
+            "total_count": len(scan_targets),
+            "findings_ingested": 0,
+            "message": "Dispatched drift-check.yml on GitHub Actions...",
+            "steps": [
+                {
+                    "time": started_at,
+                    "message": f"Dispatched drift-check.yml for {len(scan_targets)} stack(s): {', '.join(t['label'] for t in scan_targets)}.",
+                }
+            ],
+            "targets": scan_targets,
+        })
+        self._scans[correlation_id] = scan
+        self._latest_scan_id = correlation_id
         return {
             "mode": "github_actions",
             "correlation_id": correlation_id,
             "message": " · ".join(results),
+            "scan": scan,
         }
+
+    def get_latest_scan(self) -> dict[str, Any] | None:
+        if not self._latest_scan_id:
+            return None
+        return self._scans.get(self._latest_scan_id)
+
+    def list_scans(self) -> list[dict[str, Any]]:
+        return list(reversed(list(self._scans.values())))
+
+    @staticmethod
+    def _log_scan_step(scan: dict[str, Any], message: str) -> None:
+        steps = scan.setdefault("steps", [])
+        if not steps or steps[-1].get("message") != message:
+            steps.append({"time": _utcnow().isoformat(), "message": message})
+
+    async def poll_scan_status(self, correlation_id: str) -> dict[str, Any]:
+        """Poll GitHub Actions for a dispatched scan and auto-ingest completed reports."""
+        scan = self._scans.get(correlation_id)
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found.")
+        if scan["status"] in ("completed", "partial_failure", "failed"):
+            return scan
+
+        by_repo: dict[str, list[dict[str, Any]]] = {}
+        for t in scan["targets"]:
+            if t["status"] not in ("synced", "failed"):
+                by_repo.setdefault(t["repo"], []).append(t)
+
+        started_dt = datetime.fromisoformat(scan["started_at"])
+        for repo, pending_targets in by_repo.items():
+            gh = self._gh(repo)
+            try:
+                runs = await gh.list_workflow_runs("drift-check.yml", per_page=25)
+            except (GitHubError, httpx.RequestError) as exc:
+                logger.warning("Poll list_workflow_runs failed for %s: %s", repo, exc)
+                continue
+
+            claimed_ids = {t["run_id"] for t in scan["targets"] if t.get("run_id")}
+            for target in pending_targets:
+                run = None
+                if target.get("run_id"):
+                    run = next((r for r in runs if r.get("id") == target["run_id"]), None)
+                if run is None:
+                    # Match by correlation_id + root_dir in display_title
+                    for candidate in runs:
+                        cid = candidate.get("id")
+                        if cid in claimed_ids:
+                            continue
+                        title = str(candidate.get("display_title") or "")
+                        if f"[{correlation_id}]" in title:
+                            if not target["root_dir"] or target["root_dir"] in title:
+                                run = candidate
+                                break
+                if run is None:
+                    # Fallback for older workflow runs without correlation_id in run-name:
+                    # match runs created shortly before/after scan start for this root_dir
+                    for candidate in runs:
+                        cid = candidate.get("id")
+                        if cid in claimed_ids:
+                            continue
+                        created_raw = candidate.get("created_at")
+                        if not created_raw:
+                            continue
+                        try:
+                            created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                        except ValueError:
+                            continue
+                        if (created_dt - started_dt).total_seconds() < -15:
+                            continue
+                        title = str(candidate.get("display_title") or "")
+                        if not target["root_dir"] or target["root_dir"] in title:
+                            run = candidate
+                            break
+
+                if run is None:
+                    continue
+
+                claimed_ids.add(run["id"])
+                prev_status = target["status"]
+                target["run_id"] = run["id"]
+                target["run_number"] = run.get("run_number")
+                target["run_url"] = run.get("html_url")
+                gh_status = run.get("status")
+                conclusion = run.get("conclusion")
+                target["conclusion"] = conclusion
+
+                if gh_status in ("queued", "waiting", "pending", "requested"):
+                    target["status"] = "queued"
+                    if prev_status != "queued" or not target.get("_logged_queued"):
+                        target["_logged_queued"] = True
+                        self._log_scan_step(scan, f"{target['label']}: GitHub Actions run #{run.get('run_number')} queued.")
+                elif gh_status == "in_progress":
+                    target["status"] = "in_progress"
+                    if prev_status != "in_progress":
+                        self._log_scan_step(
+                            scan, f"{target['label']}: GitHub Actions run #{run.get('run_number')} running Terraform plan..."
+                        )
+                elif gh_status == "completed":
+                    if conclusion != "success":
+                        target["status"] = "failed"
+                        target["error"] = f"Workflow finished with conclusion '{conclusion}'."
+                        self._log_scan_step(
+                            scan, f"{target['label']}: run #{run.get('run_number')} failed ({conclusion})."
+                        )
+                        continue
+                    target["status"] = "syncing"
+                    self._log_scan_step(
+                        scan, f"{target['label']}: run #{run.get('run_number')} succeeded — fetching redacted drift report..."
+                    )
+                    try:
+                        files = await self._load_run_report(gh, run, repo)
+                        if files is None:
+                            target["status"] = "failed"
+                            target["error"] = f"No drift report found for run #{run.get('run_number')}."
+                            self._log_scan_step(scan, f"{target['label']}: drift report missing for run #{run.get('run_number')}.")
+                            continue
+                        plan = files.get("plan.redacted.json")
+                        meta = files.get("meta.json") or {}
+                        if not isinstance(plan, dict) or not plan or not isinstance(meta, dict):
+                            target["status"] = "failed"
+                            target["error"] = "Invalid drift report payload."
+                            self._log_scan_step(scan, f"{target['label']}: invalid drift report payload.")
+                            continue
+                        ingested = self.ingest_plan(plan, {**meta, "repo": repo})
+                        target["findings_count"] = len(ingested)
+                        target["status"] = "synced"
+                        self._log_scan_step(
+                            scan,
+                            f"{target['label']}: auto-synced {len(ingested)} drift finding(s) from run #{run.get('run_number')}.",
+                        )
+                    except HTTPException as exc:
+                        target["status"] = "failed"
+                        target["error"] = str(exc.detail)
+                        self._log_scan_step(scan, f"{target['label']}: sync failed ({exc.detail}).")
+                    except Exception as exc:
+                        target["status"] = "failed"
+                        target["error"] = str(exc)
+                        self._log_scan_step(scan, f"{target['label']}: sync error ({exc}).")
+
+        updated = self._recompute_scan_progress(scan)
+        if updated["status"] in ("completed", "partial_failure", "failed"):
+            self._log_scan_step(updated, updated["message"])
+        return updated
 
     def _read_s3_drift_report(self, run_id: int, attempt: int, repo: str) -> dict[str, Any] | None:
         key = f"drift-reports/{repo}/{run_id}/{attempt}.json"
@@ -377,6 +618,24 @@ class Orchestrator:
         tf_context = ""
         if not self.settings.github_configured or finding.repo.lower() == self.settings.github_repo.strip().lower():
             tf_context = _read_local_tf_context(self.settings.resolved_local_infra_path, finding.root_dir)
+        user_prompt = build_investigation_prompt(finding, tf_context)
+        trace_events: list[dict[str, str]] = [
+            {"stage": "start", "detail": f"Sending drift context for {finding.address} to {model_id} ({region})."}
+        ]
+        trace = self.store.save_model_trace(
+            ModelTrace(
+                finding_id=finding.id,
+                finding_address=finding.address,
+                kind="investigation",
+                status="running",
+                engine="strands-bedrock-mcp",
+                model_id=model_id,
+                bedrock_region=region,
+                system_prompt=INVESTIGATOR_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                events_json=json.dumps(trace_events),
+            )
+        )
         inv = self.store.save_investigation(
             Investigation(
                 finding_id=finding.id,
@@ -387,13 +646,29 @@ class Orchestrator:
         )
 
         try:
-            report, engine_name, mcp_servers = await investigate_finding(finding, settings, tf_context)
+            report, engine_name, mcp_servers = await investigate_finding(
+                finding, settings, tf_context, trace_events=trace_events
+            )
             inv.status = "completed"
             inv.engine = engine_name
             inv.mcp_servers_json = json.dumps(mcp_servers)
             inv.report_json = report.model_dump_json()
             inv.completed_at = _utcnow()
             self.store.save_investigation(inv)
+
+            trace_events.append(
+                {
+                    "stage": "completed",
+                    "detail": f"Received structured InvestigationReport (recommended={report.recommended_action}, confidence={int(report.confidence * 100)}%).",
+                }
+            )
+            trace.status = "completed"
+            trace.engine = engine_name
+            trace.mcp_servers_json = json.dumps(mcp_servers)
+            trace.reply_text = json.dumps(report.model_dump(), indent=2)
+            trace.events_json = json.dumps(trace_events, default=str)
+            trace.completed_at = _utcnow()
+            self.store.save_model_trace(trace)
 
             finding.severity = report.severity
             finding.status = "investigated"
@@ -407,6 +682,7 @@ class Orchestrator:
                 actor=engine_name,
                 details={
                     "investigation_id": inv.id,
+                    "trace_id": trace.id,
                     "actor_found": report.actor,
                     "recommended_action": report.recommended_action,
                     "mcp_servers": mcp_servers,
@@ -418,6 +694,14 @@ class Orchestrator:
             inv.error = str(exc)
             inv.completed_at = _utcnow()
             self.store.save_investigation(inv)
+
+            trace_events.append({"stage": "error", "detail": str(exc)})
+            trace.status = "failed"
+            trace.error = str(exc)
+            trace.events_json = json.dumps(trace_events, default=str)
+            trace.completed_at = _utcnow()
+            self.store.save_model_trace(trace)
+
             finding.status = "open"
             self.store.save_finding(finding)
             self.store.record_audit(
@@ -731,17 +1015,58 @@ class Orchestrator:
                 _, resolved_rel = _resolve_tf_dir(work_dir, finding.root_dir)
                 finding.root_dir = resolved_rel
                 patcher_settings = self.settings
+                patch_model_id = self.settings.claude_model
+                patch_region = self.settings.aws_region
                 if self.settings.claude_use_bedrock:
-                    model_id, region = self.settings.resolve_bedrock_model(
+                    patch_model_id, patch_region = self.settings.resolve_bedrock_model(
                         self.settings.claude_model, self.store.get_model_preferences().patcher
                     )
-                    patcher_settings = self.settings.model_copy(update={"claude_model": model_id, "bedrock_region": region})
-                patch = await patch_terraform_workspace(
-                    repo_dir=work_dir,
-                    finding=finding,
-                    settings=patcher_settings,
-                    extra_instructions=extra_instructions,
+                    patcher_settings = self.settings.model_copy(
+                        update={"claude_model": patch_model_id, "bedrock_region": patch_region}
+                    )
+                patch_prompt = build_patch_prompt(finding, extra_instructions)
+                patch_trace = self.store.save_model_trace(
+                    ModelTrace(
+                        finding_id=finding.id,
+                        finding_address=finding.address,
+                        kind="patcher",
+                        status="running",
+                        engine="claude-agent-sdk",
+                        model_id=patch_model_id,
+                        bedrock_region=patch_region,
+                        system_prompt=PATCHER_SYSTEM_PROMPT,
+                        user_prompt=patch_prompt,
+                        events_json=json.dumps([{"stage": "start", "detail": f"Launching Claude Agent SDK on {finding.root_dir}/."}]),
+                    )
                 )
+                try:
+                    patch = await patch_terraform_workspace(
+                        repo_dir=work_dir,
+                        finding=finding,
+                        settings=patcher_settings,
+                        extra_instructions=extra_instructions,
+                    )
+                except Exception as patch_exc:
+                    patch_trace.status = "failed"
+                    patch_trace.error = str(patch_exc)
+                    patch_trace.completed_at = _utcnow()
+                    self.store.save_model_trace(patch_trace)
+                    raise
+                patch_trace.status = "completed"
+                patch_trace.engine = patch.engine
+                patch_trace.reply_text = (
+                    f"{patch.summary}\n\n--- Modified Files ---\n"
+                    + ("\n".join(patch.modified_files) or "(none)")
+                    + f"\n\n--- Unified Diff ---\n{patch.diff or '(empty diff)'}"
+                )
+                patch_trace.events_json = json.dumps(
+                    [{"stage": "start", "detail": f"Launched Claude Agent SDK on {finding.root_dir}/."}]
+                    + list(patch.trace_events)
+                    + [{"stage": "completed", "detail": f"Modified {len(patch.modified_files)} file(s)."}],
+                    default=str,
+                )
+                patch_trace.completed_at = _utcnow()
+                self.store.save_model_trace(patch_trace)
                 rem.patch_summary = patch.summary
                 rem.patch_diff = patch.diff
 

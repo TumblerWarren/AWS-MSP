@@ -27,6 +27,7 @@ interface Props {
   onRestore: (rationale: string) => void;
   onUpdateTerraform: (rationale: string) => void;
   onVerify: (simulateClean: boolean) => void;
+  onInspectTrace?: () => void;
   githubConfigured: boolean;
 }
 
@@ -148,6 +149,7 @@ export function FindingDetailView({
   onRestore,
   onUpdateTerraform,
   onVerify,
+  onInspectTrace,
   githubConfigured,
 }: Props) {
   const [rationale, setRationale] = useState("");
@@ -182,6 +184,15 @@ export function FindingDetailView({
         </div>
 
         <div className="flex items-center gap-2">
+          {onInspectTrace && (
+            <button
+              type="button"
+              onClick={onInspectTrace}
+              className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800 cursor-pointer transition"
+            >
+              Prompt & Reply
+            </button>
+          )}
           <button
             onClick={onInvestigate}
             disabled={busyAction !== null}

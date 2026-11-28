@@ -20,6 +20,7 @@ from .models import (
     Finding,
     IngestPlanRequest,
     Investigation,
+    ModelTrace,
     Remediation,
     RestoreBatchRequest,
     TriggerScanRequest,
@@ -91,6 +92,27 @@ def _serialize_audit(ev: AuditEvent) -> dict[str, Any]:
         "summary": ev.summary,
         "details": json.loads(ev.details_json or "{}"),
         "created_at": ev.created_at.isoformat(),
+    }
+
+
+def _serialize_trace(tr: ModelTrace) -> dict[str, Any]:
+    return {
+        "id": tr.id,
+        "finding_id": tr.finding_id,
+        "finding_address": tr.finding_address,
+        "kind": tr.kind,
+        "status": tr.status,
+        "engine": tr.engine,
+        "model_id": tr.model_id,
+        "bedrock_region": tr.bedrock_region,
+        "mcp_servers": json.loads(tr.mcp_servers_json or "[]"),
+        "system_prompt": tr.system_prompt,
+        "user_prompt": tr.user_prompt,
+        "reply_text": tr.reply_text,
+        "events": json.loads(tr.events_json or "[]"),
+        "error": tr.error,
+        "created_at": tr.created_at.isoformat(),
+        "completed_at": tr.completed_at.isoformat() if tr.completed_at else None,
     }
 
 
@@ -269,6 +291,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/scans/trigger")
     async def trigger_scan(body: TriggerScanRequest, o: Orchestrator = Depends(get_orch)) -> dict[str, Any]:
         return await o.trigger_scan(ref=body.ref)
+
+    @app.get("/api/scans")
+    def list_scans(o: Orchestrator = Depends(get_orch)) -> list[dict[str, Any]]:
+        return o.list_scans()
+
+    @app.get("/api/scans/active")
+    def get_active_scan(o: Orchestrator = Depends(get_orch)) -> dict[str, Any] | None:
+        return o.get_latest_scan()
+
+    @app.get("/api/scans/{correlation_id}")
+    async def poll_scan(correlation_id: str, o: Orchestrator = Depends(get_orch)) -> dict[str, Any]:
+        return await o.poll_scan_status(correlation_id)
+
+    @app.get("/api/traces")
+    def list_traces(finding_id: str | None = None, s: Store = Depends(get_store)) -> list[dict[str, Any]]:
+        return [_serialize_trace(t) for t in s.list_model_traces(finding_id=finding_id)]
 
     @app.post("/api/scans/sync")
     async def sync_latest_scan(o: Orchestrator = Depends(get_orch), s: Store = Depends(get_store)) -> dict[str, Any]:

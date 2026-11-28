@@ -137,6 +137,62 @@ export interface ModelPreferences {
   patcher: string | null;
 }
 
+export interface ScanTargetProgress {
+  repo: string;
+  root_dir: string | null;
+  label: string;
+  status: "queued" | "in_progress" | "syncing" | "synced" | "failed";
+  conclusion: string | null;
+  run_id: number | null;
+  run_number: number | null;
+  run_url: string | null;
+  findings_count: number;
+  error: string | null;
+}
+
+export interface ScanStep {
+  time: string;
+  message: string;
+}
+
+export interface ScanProgress {
+  correlation_id: string;
+  started_at: string;
+  updated_at: string;
+  status: "running" | "completed" | "partial_failure" | "failed";
+  progress_pct: number;
+  completed_count: number;
+  total_count: number;
+  findings_ingested: number;
+  message: string;
+  steps: ScanStep[];
+  targets: ScanTargetProgress[];
+}
+
+export interface ModelTraceEvent {
+  stage: string;
+  detail: string;
+}
+
+export interface ModelTrace {
+  id: string;
+  finding_id: string;
+  finding_address: string;
+  kind: "investigation" | "patcher";
+  status: "running" | "completed" | "failed";
+  engine: string;
+  model_id: string;
+  bedrock_region: string;
+  mcp_servers: string[];
+  system_prompt: string;
+  user_prompt: string;
+  reply_text: string;
+  events: ModelTraceEvent[];
+  error: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
 export interface PlatformConfig {
   github_configured: boolean;
   github_repo: string;

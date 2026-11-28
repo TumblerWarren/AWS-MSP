@@ -1,4 +1,12 @@
-import type { FindingDetail, FindingSummary, ModelPreferences, PlatformConfig, Remediation } from "./types";
+import type {
+  FindingDetail,
+  FindingSummary,
+  ModelPreferences,
+  ModelTrace,
+  PlatformConfig,
+  Remediation,
+  ScanProgress,
+} from "./types";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -39,10 +47,15 @@ export const api = {
     }),
   listFindings: () => req<FindingSummary[]>("/api/findings"),
   getFinding: (id: string) => req<FindingDetail>(`/api/findings/${id}`),
-  triggerScan: () => req<{ mode: string; correlation_id: string; message: string }>("/api/scans/trigger", {
+  triggerScan: () => req<{ mode: string; correlation_id: string; message: string; scan?: ScanProgress }>("/api/scans/trigger", {
     method: "POST",
     body: JSON.stringify({}),
   }),
+  listScans: () => req<ScanProgress[]>("/api/scans"),
+  activeScan: () => req<ScanProgress | null>("/api/scans/active"),
+  pollScan: (correlationId: string) => req<ScanProgress>(`/api/scans/${correlationId}`),
+  listTraces: (findingId?: string) =>
+    req<ModelTrace[]>(findingId ? `/api/traces?finding_id=${encodeURIComponent(findingId)}` : "/api/traces"),
   syncGitHub: () => req<{ synced: boolean; run_id: number | null; run_url?: string; message: string; findings: FindingSummary[] }>("/api/scans/sync", {
     method: "POST",
   }),

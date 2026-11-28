@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   CheckCircle2,
   Cpu,
   KeyRound,
+  MessageSquareCode,
   Play,
   RefreshCw,
   Search,
@@ -12,8 +13,17 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api";
+import { ActivityPage } from "./components/ActivityPage";
 import { FindingDetailView } from "./components/FindingDetail";
-import type { FindingDetail, FindingSummary, ModelPreferences, PlatformConfig } from "./types";
+import { ScanProgressBar } from "./components/ScanProgressBar";
+import type {
+  FindingDetail,
+  FindingSummary,
+  ModelPreferences,
+  ModelTrace,
+  PlatformConfig,
+  ScanProgress,
+} from "./types";
 
 const sevDot: Record<string, string> = {
   critical: "bg-red-500",
@@ -43,6 +53,13 @@ export function App() {
   const [showCreds, setShowCreds] = useState(false);
   const [modelForm, setModelForm] = useState<ModelPreferences | null>(null);
   const [restoreReview, setRestoreReview] = useState<{ anchor: string; rationale: string; fingerprints: Record<string, string> } | null>(null);
+  const [activePage, setActivePage] = useState<"inbox" | "activity">("inbox");
+  const [activeScan, setActiveScan] = useState<ScanProgress | null>(null);
+  const [scanDismissed, setScanDismissed] = useState(false);
+  const [allScans, setAllScans] = useState<ScanProgress[]>([]);
+  const [modelTraces, setModelTraces] = useState<ModelTrace[]>([]);
+  const [traceFindingFilter, setTraceFindingFilter] = useState<string | null>(null);
+  const prevSyncedCount = useRef(0);
   const [credForm, setCredForm] = useState({
     aws_access_key_id: "",
     aws_secret_access_key: "",
@@ -66,9 +83,57 @@ export function App() {
     setDetail(d);
   }
 
+  async function refreshActivity() {
+    const [scans, traces] = await Promise.all([api.listScans(), api.listTraces()]);
+    setAllScans(scans);
+    setModelTraces(traces);
+    if (scans.length > 0) {
+      setActiveScan(scans[0]);
+    }
+  }
+
   useEffect(() => {
     refreshList(false).catch((err) => setBanner({ kind: "error", text: String(err) }));
+    refreshActivity().catch(() => {});
   }, []);
+
+  // Auto-poll active drift scan every 3 seconds and auto-refresh Drift Inbox as stacks finish syncing
+  useEffect(() => {
+    if (!activeScan || activeScan.status !== "running") return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const updated = await api.pollScan(activeScan.correlation_id);
+        if (cancelled) return;
+        setActiveScan(updated);
+        setAllScans((prev) => [updated, ...prev.filter((s) => s.correlation_id !== updated.correlation_id)]);
+        const syncedNow = updated.targets.filter((t) => t.status === "synced").length;
+        if (syncedNow > prevSyncedCount.current || updated.status !== "running") {
+          prevSyncedCount.current = syncedNow;
+          await refreshList();
+        }
+      } catch {
+        // transient poll error; next interval will retry
+      }
+    };
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeScan?.correlation_id, activeScan?.status]);
+
+  // Refresh AI model traces automatically while on the Activity page or when an AI action is busy
+  useEffect(() => {
+    if (activePage !== "activity" && busyAction !== "investigate" && busyAction !== "update") return;
+    void refreshActivity().catch(() => {});
+    const timer = window.setInterval(() => {
+      void refreshActivity().catch(() => {});
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [activePage, busyAction]);
 
   useEffect(() => {
     if (selectedId) {
@@ -144,6 +209,36 @@ export function App() {
             <span className="text-xs text-zinc-500 hidden sm:inline">Drift Investigation & Reconciliation</span>
           </div>
 
+          <nav className="flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-950 p-0.5 text-xs">
+            <button
+              type="button"
+              onClick={() => setActivePage("inbox")}
+              className={`inline-flex items-center gap-1.5 rounded px-2.5 py-1 font-medium cursor-pointer transition ${
+                activePage === "inbox" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              <Activity className="w-3.5 h-3.5" />
+              Drift Inbox
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setTraceFindingFilter(null);
+                setActivePage("activity");
+                void refreshActivity().catch(() => {});
+              }}
+              className={`inline-flex items-center gap-1.5 rounded px-2.5 py-1 font-medium cursor-pointer transition ${
+                activePage === "activity" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              <MessageSquareCode className="w-3.5 h-3.5" />
+              Activity & Model Traces
+              {(activeScan?.status === "running" || modelTraces.some((t) => t.status === "running")) && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              )}
+            </button>
+          </nav>
+
           {config && (
             <div className="hidden xl:flex items-center gap-2 pl-3 border-l border-zinc-800 font-mono text-[11px]">
               <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 ${config.github_configured ? "border-emerald-500/30 text-emerald-300 bg-emerald-500/5" : "border-zinc-800 text-zinc-400 bg-zinc-900"}`}>
@@ -194,15 +289,21 @@ export function App() {
             onClick={() =>
               runAction("scan", async () => {
                 const res = await api.triggerScan();
+                prevSyncedCount.current = 0;
+                if (res.scan) {
+                  setActiveScan(res.scan);
+                  setScanDismissed(false);
+                  setAllScans((prev) => [res.scan!, ...prev.filter((s) => s.correlation_id !== res.scan!.correlation_id)]);
+                }
                 await refreshList();
-                setBanner({ kind: "info", text: res.message });
+                setBanner({ kind: "info", text: "Drift scan dispatched — auto-polling GitHub Actions & auto-syncing reports..." });
               })
             }
-            disabled={busyAction !== null}
+            disabled={busyAction !== null || activeScan?.status === "running"}
             className="inline-flex items-center gap-1.5 rounded-md bg-zinc-100 px-3 py-1.5 text-xs font-semibold text-zinc-950 hover:bg-white disabled:opacity-50 cursor-pointer"
           >
             <Play className="w-3 h-3" />
-            Run Drift Scan
+            {activeScan?.status === "running" ? `Scanning (${activeScan.progress_pct}%)…` : "Run Drift Scan"}
           </button>
 
           <button
@@ -214,9 +315,10 @@ export function App() {
               })
             }
             disabled={busyAction !== null}
-            className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50 cursor-pointer"
+            title="Manually pull the latest completed GitHub Actions drift report(s)"
+            className="inline-flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800 disabled:opacity-50 cursor-pointer"
           >
-            Sync GitHub
+            Force Sync
           </button>
 
           <button
@@ -299,7 +401,41 @@ export function App() {
         </section>
       )}
 
-      {/* Workspace: Left Drift Inbox + Right Finding Detail */}
+      {activeScan && !scanDismissed && activePage === "inbox" && (
+        <ScanProgressBar
+          scan={activeScan}
+          onOpenActivity={() => {
+            setTraceFindingFilter(null);
+            setActivePage("activity");
+            void refreshActivity().catch(() => {});
+          }}
+          onDismiss={() => setScanDismissed(true)}
+        />
+      )}
+
+      {activePage === "activity" ? (
+        <ActivityPage
+          scans={allScans}
+          traces={modelTraces}
+          initialFindingFilter={traceFindingFilter}
+          busyAction={busyAction}
+          onRefresh={() => {
+            void refreshActivity().catch(() => {});
+          }}
+          onTriggerScan={() =>
+            runAction("scan", async () => {
+              const res = await api.triggerScan();
+              prevSyncedCount.current = 0;
+              if (res.scan) {
+                setActiveScan(res.scan);
+                setScanDismissed(false);
+                setAllScans((prev) => [res.scan!, ...prev.filter((s) => s.correlation_id !== res.scan!.correlation_id)]);
+              }
+            })
+          }
+        />
+      ) : (
+      /* Workspace: Left Drift Inbox + Right Finding Detail */
       <div className="flex-1 flex flex-col md:flex-row min-h-0">
         <aside className="w-full md:w-80 lg:w-96 max-h-[42vh] md:max-h-none border-b md:border-b-0 md:border-r border-zinc-800/80 bg-[#0b0b0e] flex flex-col shrink-0">
           <div className="p-3 border-b border-zinc-800/80 space-y-2.5">
@@ -488,6 +624,11 @@ export function App() {
                   await refreshList();
                 })
               }
+              onInspectTrace={() => {
+                setTraceFindingFilter(detail.id);
+                setActivePage("activity");
+                void refreshActivity().catch(() => {});
+              }}
             />
             </>
           ) : (
@@ -503,6 +644,7 @@ export function App() {
           )}
         </main>
       </div>
+      )}
 
       {showCreds && (
         <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">

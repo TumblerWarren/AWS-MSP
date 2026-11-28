@@ -150,6 +150,27 @@ class ModelPreferences(SQLModel, table=True):
     patcher: str | None = None
 
 
+class ModelTrace(SQLModel, table=True):
+    """Stores the exact prompt sent to and reply received from each AI model run."""
+
+    id: str = Field(default_factory=lambda: _uid("trc"), primary_key=True)
+    finding_id: str = Field(index=True)
+    finding_address: str = ""
+    kind: str = "investigation"  # investigation | patcher
+    status: str = "running"  # running | completed | failed
+    engine: str = ""
+    model_id: str = ""
+    bedrock_region: str = ""
+    mcp_servers_json: str = "[]"
+    system_prompt: str = ""
+    user_prompt: str = ""
+    reply_text: str = ""
+    events_json: str = "[]"
+    error: str | None = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    completed_at: datetime | None = None
+
+
 # ---------------------------------------------------------------------------
 # API Request / Response DTOs
 # ---------------------------------------------------------------------------

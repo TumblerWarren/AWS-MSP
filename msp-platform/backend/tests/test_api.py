@@ -456,4 +456,86 @@ def test_multi_folder_scan_sync_and_restore_in_single_repo(tmp_path: Path):
         assert dispatch.await_args.kwargs["inputs"]["expected_root"] == "msp-sandbox-infra/stacks/ec2"
 
 
+def test_auto_poll_scan_progress_and_model_traces(tmp_path: Path):
+    roots = ["msp-sandbox-infra/stacks/networking", "msp-sandbox-infra/stacks/ec2"]
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        github_repo="TumblerWarren/AWS-MSP",
+        github_token="example-token",
+        dry_run_github=False,
+        drift_report_bucket="msp-drift-reports-test",
+        terraform_roots=roots,
+    )
+    full = combined_demo_plan()
+    sg_plan = {**full, "resource_drift": [full["resource_drift"][0]], "resource_changes": [full["resource_changes"][0]]}
+    ec2_plan = {**full, "resource_drift": [full["resource_drift"][1]], "resource_changes": [full["resource_changes"][1]]}
+
+    dispatch = AsyncMock(return_value=None)
+    s3 = Mock()
+
+    with (
+        TestClient(create_app(settings)) as client,
+        patch("app.services.github_client.GitHubClient.dispatch_workflow", autospec=True, side_effect=dispatch),
+        patch("app.services.orchestrator.boto3.client", return_value=s3),
+    ):
+        trig = client.post("/api/scans/trigger", json={})
+        assert trig.status_code == 200
+        cid = trig.json()["correlation_id"]
+        assert trig.json()["scan"]["status"] == "running"
+        assert trig.json()["scan"]["total_count"] == 2
+
+        # Poll 1: networking in_progress, ec2 queued
+        poll1_runs = [
+            {"id": 201, "run_number": 21, "display_title": f"Drift Check ({roots[0]}) [{cid}]", "status": "in_progress", "conclusion": None, "html_url": "https://github.com/run/201"},
+            {"id": 202, "run_number": 22, "display_title": f"Drift Check ({roots[1]}) [{cid}]", "status": "queued", "conclusion": None, "html_url": "https://github.com/run/202"},
+        ]
+        with patch("app.services.github_client.GitHubClient.list_workflow_runs", return_value=poll1_runs):
+            p1 = client.get(f"/api/scans/{cid}").json()
+            assert p1["status"] == "running"
+            assert p1["progress_pct"] == 35  # (55 + 15) / 2
+
+        # Poll 2: both completed -> auto-ingests from S3 with zero manual Sync call
+        reports = {
+            "drift-reports/tumblerwarren/aws-msp/201/1.json": {
+                "plan.redacted.json": sg_plan,
+                "meta.json": {"account_id": "135443845882", "region": "ap-south-1", "root_dir": roots[0], "commit_sha": "b" * 40, "state_serial": 1, "state_lineage": "net"},
+            },
+            "drift-reports/tumblerwarren/aws-msp/202/1.json": {
+                "plan.redacted.json": ec2_plan,
+                "meta.json": {"account_id": "135443845882", "region": "ap-south-1", "root_dir": roots[1], "commit_sha": "b" * 40, "state_serial": 1, "state_lineage": "ec2"},
+            },
+        }
+        s3.get_object.side_effect = lambda Bucket, Key: {"Body": BytesIO(json.dumps(reports[Key]).encode())}
+        poll2_runs = [
+            {**poll1_runs[0], "status": "completed", "conclusion": "success", "run_attempt": 1},
+            {**poll1_runs[1], "status": "completed", "conclusion": "success", "run_attempt": 1},
+        ]
+        with patch("app.services.github_client.GitHubClient.list_workflow_runs", return_value=poll2_runs):
+            p2 = client.get(f"/api/scans/{cid}").json()
+            assert p2["status"] == "completed"
+            assert p2["progress_pct"] == 100
+            assert p2["findings_ingested"] == 2
+            assert len(p2["steps"]) >= 3
+
+        # Verify findings were automatically saved in Drift Inbox
+        findings = client.get("/api/findings").json()
+        assert len(findings) == 2
+
+        # Verify AI Investigation records full prompt sent & reply received in /api/traces
+        with patch(
+            "app.services.orchestrator.investigate_finding",
+            new=AsyncMock(return_value=(_mock_sg_report(), "strands-bedrock-mcp", ["awslabs.aws-api-mcp-server"])),
+        ):
+            inv = client.post(f"/api/findings/{findings[0]['id']}/investigate")
+            assert inv.status_code == 200
+
+        traces = client.get(f"/api/traces?finding_id={findings[0]['id']}").json()
+        assert len(traces) == 1
+        assert traces[0]["status"] == "completed"
+        assert "senior AWS cloud" in traces[0]["system_prompt"]
+        assert findings[0]["address"] in traces[0]["user_prompt"]
+        assert "Port 22" in traces[0]["reply_text"]
+
+
+
 

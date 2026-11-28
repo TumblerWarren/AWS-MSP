@@ -1,5 +1,5 @@
 name: Drift Check
-run-name: Drift Check (${{ inputs.root_dir || 'msp-sandbox-infra/stacks/networking' }})
+run-name: Drift Check (${{ inputs.root_dir || 'msp-sandbox-infra/stacks/networking' }}) [${{ inputs.correlation_id || 'manual' }}]
 
 on:
   workflow_dispatch:

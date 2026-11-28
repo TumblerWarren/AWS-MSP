@@ -16,10 +16,10 @@ import json
 import logging
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, ToolUseBlock, query
 
 from ..config import Settings
 from ..models import Finding
@@ -34,6 +34,7 @@ class PatchResult:
     diff: str
     modified_files: list[str]
     engine: str = "claude-agent-sdk"
+    trace_events: list[dict[str, str]] = field(default_factory=list)
 
 
 SYSTEM_PROMPT = """\
@@ -53,7 +54,7 @@ Guidelines:
 """
 
 
-def _build_patch_prompt(finding: Finding, extra_instructions: str = "") -> str:
+def build_patch_prompt(finding: Finding, extra_instructions: str = "") -> str:
     changes = json.loads(finding.changes_json or "[]")
     lines = [
         f"Update the Terraform configuration in `{finding.root_dir}/` to reconcile drift on:",
@@ -74,6 +75,9 @@ def _build_patch_prompt(finding: Finding, extra_instructions: str = "") -> str:
         ]
     )
     return "\n".join(lines)
+
+
+_build_patch_prompt = build_patch_prompt
 
 
 def _claude_env(settings: Settings) -> dict[str, str]:
@@ -127,8 +131,16 @@ async def patch_terraform_workspace(
     )
 
     summary_text = ""
-    async for message in query(prompt=_build_patch_prompt(finding, extra_instructions), options=options):
-        if isinstance(message, ResultMessage):
+    trace_events: list[dict[str, str]] = []
+    async for message in query(prompt=build_patch_prompt(finding, extra_instructions), options=options):
+        if isinstance(message, AssistantMessage):
+            for block in getattr(message, "content", []) or []:
+                if isinstance(block, ToolUseBlock):
+                    inp = json.dumps(getattr(block, "input", {}), default=str)[:400]
+                    trace_events.append({"stage": "tool_call", "detail": f"{block.name}({inp})"})
+                elif isinstance(block, TextBlock) and block.text.strip():
+                    trace_events.append({"stage": "assistant", "detail": block.text.strip()[:800]})
+        elif isinstance(message, ResultMessage):
             if message.is_error:
                 raise RuntimeError(f"Claude Agent SDK patcher error: {message.result}")
             if message.result:
@@ -154,4 +166,5 @@ async def patch_terraform_workspace(
         diff=diff,
         modified_files=modified_files,
         engine="claude-agent-sdk",
+        trace_events=trace_events,
     )

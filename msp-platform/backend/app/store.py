@@ -10,7 +10,7 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy import func
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from .models import AuditEvent, Finding, Investigation, ModelPreferences, Remediation
+from .models import AuditEvent, Finding, Investigation, ModelPreferences, ModelTrace, Remediation
 
 
 def _utcnow() -> datetime:
@@ -154,4 +154,20 @@ class Store:
                 .where(AuditEvent.finding_id == finding_id)
                 .order_by(AuditEvent.created_at.desc())  # type: ignore[union-attr]
             )
+            return list(s.exec(stmt).all())
+
+    # --- Model Traces (Prompts Sent & Replies Received) ---
+    def save_model_trace(self, trace: ModelTrace) -> ModelTrace:
+        with Session(self.engine) as s:
+            s.add(trace)
+            s.commit()
+            s.refresh(trace)
+            return trace
+
+    def list_model_traces(self, finding_id: str | None = None, limit: int = 50) -> list[ModelTrace]:
+        with Session(self.engine) as s:
+            stmt = select(ModelTrace)
+            if finding_id:
+                stmt = stmt.where(ModelTrace.finding_id == finding_id)
+            stmt = stmt.order_by(ModelTrace.created_at.desc()).limit(limit)  # type: ignore[union-attr]
             return list(s.exec(stmt).all())

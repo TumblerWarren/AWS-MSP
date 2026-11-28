@@ -51,7 +51,7 @@ How to investigate:
 """
 
 
-def _build_investigation_prompt(finding: Finding, tf_context: str) -> str:
+def build_investigation_prompt(finding: Finding, tf_context: str) -> str:
     changes = json.loads(finding.changes_json or "[]")
     restore_actions = json.loads(finding.restore_actions_json or "[]")
     sections = [
@@ -78,6 +78,9 @@ def _build_investigation_prompt(finding: Finding, tf_context: str) -> str:
         ]
     )
     return "\n".join(sections)
+
+
+_build_investigation_prompt = build_investigation_prompt
 
 
 def _create_aws_mcp_clients(env: dict[str, str]) -> list[tuple[str, MCPClient]]:
@@ -115,20 +118,52 @@ def _create_aws_mcp_clients(env: dict[str, str]) -> list[tuple[str, MCPClient]]:
     ]
 
 
+def _summarize_strands_messages(messages: list[Any]) -> list[dict[str, str]]:
+    """Extract readable tool calls and assistant steps from Strands agent.messages."""
+    steps: list[dict[str, str]] = []
+    for msg in messages or []:
+        role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
+        content = msg.get("content", []) if isinstance(msg, dict) else getattr(msg, "content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if "toolUse" in block:
+                tu = block["toolUse"]
+                name = tu.get("name", "tool")
+                inp = json.dumps(tu.get("input", {}), default=str)[:400]
+                steps.append({"stage": "tool_call", "detail": f"{name}({inp})"})
+            elif "toolResult" in block:
+                tr = block["toolResult"]
+                status = tr.get("status", "ok")
+                preview = json.dumps(tr.get("content", []), default=str)[:400]
+                steps.append({"stage": "tool_result", "detail": f"[{status}] {preview}"})
+            elif "text" in block and role == "assistant":
+                txt = str(block["text"]).strip()
+                if txt:
+                    steps.append({"stage": "assistant", "detail": txt[:800]})
+    return steps
+
+
 def _run_strands_sync(
     finding: Finding,
     settings: Settings,
     tf_context: str,
+    trace_events: list[dict[str, str]] | None = None,
 ) -> tuple[InvestigationReport, str, list[str]]:
     """Run the Strands Investigation Agent synchronously inside a worker thread."""
+    bedrock_region = settings.bedrock_region_for_model(settings.strands_model_id)
     model = BedrockModel(
         model_id=settings.strands_model_id,
-        region_name=settings.bedrock_region_for_model(settings.strands_model_id),
+        region_name=bedrock_region,
     )
-    prompt = _build_investigation_prompt(finding, tf_context)
+    prompt = build_investigation_prompt(finding, tf_context)
 
     mcp_names: list[str] = []
     tools: list[Any] = []
+    if trace_events is not None:
+        trace_events.append({"stage": "init", "detail": f"Initialized BedrockModel {settings.strands_model_id} in {bedrock_region}."})
 
     with ExitStack() as stack:
         if settings.aws_mcp_enabled:
@@ -140,8 +175,12 @@ def _run_strands_sync(
                     tools.extend(mcp_tools)
                     mcp_names.append(name)
                     logger.info("Mounted MCP server %s (%d tools).", name, len(mcp_tools))
+                    if trace_events is not None:
+                        trace_events.append({"stage": "mcp", "detail": f"Mounted {name} ({len(mcp_tools)} tools)."})
                 except Exception as exc:
                     logger.warning("Failed to mount MCP server %s: %s", name, exc)
+                    if trace_events is not None:
+                        trace_events.append({"stage": "mcp_warn", "detail": f"Could not mount {name}: {exc}"})
 
         agent = Agent(
             model=model,
@@ -149,6 +188,8 @@ def _run_strands_sync(
             system_prompt=SYSTEM_PROMPT,
         )
         result = agent(prompt, structured_output_model=InvestigationReport)
+        if trace_events is not None:
+            trace_events.extend(_summarize_strands_messages(getattr(agent, "messages", [])))
         report = result.structured_output
         if not isinstance(report, InvestigationReport):
             report = InvestigationReport.model_validate(report)
@@ -160,6 +201,7 @@ async def investigate_finding(
     finding: Finding,
     settings: Settings,
     tf_context: str,
+    trace_events: list[dict[str, str]] | None = None,
 ) -> tuple[InvestigationReport, str, list[str]]:
     """Investigate a drift finding using Strands Agents SDK + official AWS Labs MCP servers."""
     if not has_aws_credentials():
@@ -168,4 +210,4 @@ async def investigate_finding(
             "(or attach an ECS Task Role) to run live Strands + AWS MCP investigation."
         )
 
-    return await asyncio.to_thread(_run_strands_sync, finding, settings, tf_context)
+    return await asyncio.to_thread(_run_strands_sync, finding, settings, tf_context, trace_events)
